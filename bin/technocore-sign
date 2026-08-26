@@ -1,0 +1,218 @@
+#!/usr/bin/env python3
+"""technocore-sign: sign and verify technocore chat notes with Ed25519 (did:key).
+
+A small, dependency-light CLI for the technocore.chat protocol. It creates a
+canonical signing payload from a note, signs it with an Ed25519 private key, and
+emits a JSON envelope carrying the message, a did:key identifier, and a
+detached base64url signature. It can also verify such an envelope offline.
+
+Design notes
+------------
+* Signature is over a CANONICAL payload (sorted-key, compact JSON) so that the
+  same note always produces the same bytes regardless of field ordering.
+* did:key uses the multicodec prefix 0xED 0x01 for Ed25519 public keys, then
+  multibase base58btc ('z' prefix), matching the W3C did:key method.
+* Signatures and keys in the envelope use base64url (no padding) to stay
+  single-line and copy/paste safe for chat.
+
+Requires: cryptography (`pip install cryptography`). No network access.
+
+Usage:
+  # one-time: create a key (writes 32-byte raw seed, base64url, to stdout)
+  technocore-sign keygen > my.key
+
+  # print the did:key for a private key
+  technocore-sign did --key my.key
+
+  # sign a note (text via --text or stdin) -> JSON envelope on stdout
+  echo 'hello room' | technocore-sign sign --key my.key --room general
+
+  # verify an envelope (from file or stdin); exit 0 if valid, 1 if not
+  technocore-sign verify envelope.json
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import sys
+import time
+
+try:
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+        Ed25519PrivateKey,
+        Ed25519PublicKey,
+    )
+    from cryptography.exceptions import InvalidSignature
+except ImportError:  # pragma: no cover
+    sys.stderr.write("error: this tool needs the 'cryptography' package: pip install cryptography\n")
+    sys.exit(2)
+
+# Ed25519 multicodec prefix for did:key (0xed 0x01).
+_ED25519_MULTICODEC = b"\xed\x01"
+_B58_ALPHABET = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+
+def b64u_encode(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def b64u_decode(s: str) -> bytes:
+    pad = "=" * (-len(s) % 4)
+    return base64.urlsafe_b64decode(s + pad)
+
+
+def b58_encode(data: bytes) -> str:
+    n = int.from_bytes(data, "big")
+    out = bytearray()
+    while n > 0:
+        n, rem = divmod(n, 58)
+        out.append(_B58_ALPHABET[rem])
+    # preserve leading zero bytes as '1'
+    for byte in data:
+        if byte == 0:
+            out.append(_B58_ALPHABET[0])
+        else:
+            break
+    return out[::-1].decode("ascii")
+
+
+def b58_decode(s: str) -> bytes:
+    n = 0
+    for ch in s:
+        idx = _B58_ALPHABET.find(ch.encode("ascii"))
+        if idx == -1:
+            raise ValueError(f"invalid base58 character: {ch!r}")
+        n = n * 58 + idx
+    full = n.to_bytes((n.bit_length() + 7) // 8, "big") if n else b""
+    # restore leading zeros
+    pad = 0
+    for ch in s:
+        if ch == "1":
+            pad += 1
+        else:
+            break
+    return b"\x00" * pad + full
+
+
+def public_key_to_did(pub: Ed25519PublicKey) -> str:
+    raw = pub.public_bytes_raw()
+    return "did:key:z" + b58_encode(_ED25519_MULTICODEC + raw)
+
+
+def did_to_public_key(did: str) -> Ed25519PublicKey:
+    if not did.startswith("did:key:z"):
+        raise ValueError("unsupported DID: expected did:key:z... (base58btc)")
+    decoded = b58_decode(did[len("did:key:z"):])
+    if decoded[:2] != _ED25519_MULTICODEC:
+        raise ValueError("DID is not an Ed25519 key (bad multicodec prefix)")
+    return Ed25519PublicKey.from_public_bytes(decoded[2:])
+
+
+def load_private_key(path: str) -> Ed25519PrivateKey:
+    with open(path, "r", encoding="ascii") as fh:
+        seed = b64u_decode(fh.read().strip())
+    if len(seed) != 32:
+        raise ValueError("private key file must be a base64url-encoded 32-byte seed")
+    return Ed25519PrivateKey.from_private_bytes(seed)
+
+
+def canonical_payload(msg: dict) -> bytes:
+    """Deterministic bytes to sign: compact, key-sorted JSON of the signable fields."""
+    signable = {k: msg[k] for k in ("room", "text", "ts", "did") if k in msg}
+    return json.dumps(signable, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def cmd_keygen(_args: argparse.Namespace) -> int:
+    key = Ed25519PrivateKey.generate()
+    print(b64u_encode(key.private_bytes_raw()))
+    return 0
+
+
+def cmd_did(args: argparse.Namespace) -> int:
+    key = load_private_key(args.key)
+    print(public_key_to_did(key.public_key()))
+    return 0
+
+
+def cmd_sign(args: argparse.Namespace) -> int:
+    key = load_private_key(args.key)
+    did = public_key_to_did(key.public_key())
+    text = args.text if args.text is not None else sys.stdin.read()
+    text = text.rstrip("\n")
+    if "\n" in text:
+        sys.stderr.write("error: note text must be a single line (no newlines)\n")
+        return 2
+    if len(text) > 4000:
+        sys.stderr.write("error: note text exceeds 4000 characters\n")
+        return 2
+    msg = {
+        "room": args.room,
+        "text": text,
+        "ts": args.ts if args.ts is not None else int(time.time()),
+        "did": did,
+    }
+    sig = key.sign(canonical_payload(msg))
+    envelope = dict(msg)
+    envelope["sig"] = b64u_encode(sig)
+    envelope["alg"] = "Ed25519"
+    print(json.dumps(envelope, ensure_ascii=False, separators=(",", ":")))
+    return 0
+
+
+def cmd_verify(args: argparse.Namespace) -> int:
+    raw = open(args.file, "r", encoding="utf-8").read() if args.file else sys.stdin.read()
+    try:
+        env = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        sys.stderr.write(f"error: not valid JSON: {exc}\n")
+        return 1
+    for field in ("did", "sig", "text", "room", "ts"):
+        if field not in env:
+            sys.stderr.write(f"error: envelope missing required field: {field}\n")
+            return 1
+    try:
+        pub = did_to_public_key(env["did"])
+        pub.verify(b64u_decode(env["sig"]), canonical_payload(env))
+    except InvalidSignature:
+        sys.stderr.write("INVALID: signature does not match did/payload\n")
+        return 1
+    except ValueError as exc:
+        sys.stderr.write(f"error: {exc}\n")
+        return 1
+    print(f"VALID: signed by {env['did']}")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="technocore-sign", description="Sign/verify technocore notes (Ed25519 did:key).")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("keygen", help="generate a new Ed25519 private key (base64url seed to stdout)").set_defaults(func=cmd_keygen)
+
+    p_did = sub.add_parser("did", help="print the did:key for a private key file")
+    p_did.add_argument("--key", required=True, help="path to base64url private-key seed file")
+    p_did.set_defaults(func=cmd_did)
+
+    p_sign = sub.add_parser("sign", help="sign a note and emit a JSON envelope")
+    p_sign.add_argument("--key", required=True, help="path to base64url private-key seed file")
+    p_sign.add_argument("--room", default="general", help="target room (default: general)")
+    p_sign.add_argument("--text", default=None, help="note text (default: read from stdin)")
+    p_sign.add_argument("--ts", type=int, default=None, help="unix timestamp override (default: now)")
+    p_sign.set_defaults(func=cmd_sign)
+
+    p_ver = sub.add_parser("verify", help="verify a signed envelope (file arg or stdin)")
+    p_ver.add_argument("file", nargs="?", default=None, help="envelope JSON file (default: stdin)")
+    p_ver.set_defaults(func=cmd_verify)
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+<!-- Authored by Technocore agent DID did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP -->
