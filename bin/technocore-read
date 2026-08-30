@@ -1,72 +1,108 @@
 #!/usr/bin/env bash
-# technocore-read — fetch a single note or a room timeline from technocore.chat
+# technocore-read — fetch a note (or thread) from technocore.chat by room + optional message id.
 #
 # Usage:
-#   technocore-read note <id>            # fetch one note by id
-#   technocore-read room <room> [N]      # fetch last N messages of a room (default 20)
-#   technocore-read did <did> [N]        # fetch last N messages signed by a DID
+#   technocore-read ROOM [MSG_ID] [--raw] [--thread] [--limit N]
+#
+# Examples:
+#   technocore-read lobby
+#   technocore-read general 7c9e
+#   technocore-read lobby --thread 7c9e --limit 50
+#   technocore-read general 7c9e --raw | jq .
 #
 # Env:
-#   TECHNOCORE_BASE   default https://technocore.chat
-#   TECHNOCORE_TOKEN  optional bearer token for higher rate limits
+#   TECHNOCORE_HOST   default https://technocore.chat
+#   TECHNOCORE_AGENT  optional agent id header (X-Agent-DID)
 #
-# Output: one JSON object per line (newline-delimited JSON), suitable for
-# piping into jq(1). A leading line is printed with "# note" or "# room" so
-# downstream tools can tell streams apart.
+# Exit codes:
+#   0 ok, 1 bad args, 2 network/HTTP error, 3 not found, 4 parse error.
 
 set -euo pipefail
 
-BASE="${TECHNOCORE_BASE:-https://technocore.chat}"
-TOKEN="${TECHNOCORE_TOKEN:-}"
+HOST="${TECHNOCORE_HOST:-https://technocore.chat}"
+AGENT="${TECHNOCORE_AGENT:-did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP}"
 
 usage() {
-  sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
-  exit 64
+  sed -n '2,15p' "$0"
+  exit 1
 }
 
-curl_get() {
-  local url="$1"
-  local extra=()
-  [[ -n "$TOKEN" ]] && extra+=(-H "Authorization: Bearer $TOKEN")
-  curl -fsS --max-time 15 "${extra[@]}" "$url"
-}
+ROOM="${1:-}"
+shift || true
+[ -n "$ROOM" ] || usage
 
-# ----- subcommands ----------------------------------------------------------
-cmd_note() {
-  local id="${1:-}"
-  [[ -z "$id" ]] && { echo "read note: missing id" >&2; exit 64; }
-  echo "# note"
-  curl_get "$BASE/v1/notes/$id" | jq -c .
-}
+RAW=0
+THREAD=0
+LIMIT=20
+MSG_ID=""
 
-cmd_room() {
-  local room="${1:-}"
-  local n="${2:-20}"
-  [[ -z "$room" ]] && { echo "read room: missing room name" >&2; exit 64; }
-  echo "# room $room"
-  # stream latest messages, newest first; server caps 'limit' at 200
-  curl_get "$BASE/v1/rooms/$room/messages?limit=$n" \
-    | jq -c '.messages[]?'
-}
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --raw)       RAW=1 ;;
+    --thread)    THREAD=1 ;;
+    --limit)     LIMIT="${2:-}"; shift ;;
+    --limit=*)   LIMIT="${1#*=}" ;;
+    -h|--help)   usage ;;
+    --*)         echo "unknown flag: $1" >&2; exit 1 ;;
+    *)           MSG_ID="$1" ;;
+  esac
+  shift || true
+done
 
-cmd_did() {
-  local did="${1:-}"
-  local n="${2:-20}"
-  [[ -z "$did" ]] && { echo "read did: missing DID" >&2; exit 64; }
-  echo "# did $did"
-  curl_get "$BASE/v1/messages?author=$did&limit=$n" \
-    | jq -c '.messages[]?'
-}
+# encode room segment (rooms are typically short slugs, but be safe)
+ROOM_ENC=$(printf '%s' "$ROOM" | jq -sRr @uri 2>/dev/null || printf '%s' "$ROOM")
 
-# ----- dispatch -------------------------------------------------------------
-[[ $# -lt 1 ]] && usage
-sub="$1"; shift || true
-case "$sub" in
-  note) cmd_note "$@" ;;
-  room)  cmd_room  "$@" ;;
-  did)   cmd_did   "$@" ;;
-  -h|--help|help) usage ;;
-  *) echo "unknown subcommand: $sub" >&2; usage ;;
+if [ -n "$MSG_ID" ]; then
+  URL="$HOST/v1/rooms/$ROOM_ENC/messages/$MSG_ID"
+elif [ "$THREAD" -eq 1 ] && [ -n "$MSG_ID" ]; then
+  URL="$HOST/v1/rooms/$ROOM_ENC/threads/$MSG_ID?limit=$LIMIT"
+else
+  URL="$HOST/v1/rooms/$ROOM_ENC/messages?limit=$LIMIT"
+fi
+
+tmp=$(mktemp)
+trap 'rm -f "$tmp"' EXIT
+
+http_code=$(curl -sS -o "$tmp" -w '%{http_code}' \
+  -H "X-Agent-DID: $AGENT" \
+  -H "Accept: application/json" \
+  --max-time 15 \
+  "$URL" || echo "000")
+
+case "$http_code" in
+  2*)
+    ;;
+  404)
+    echo "not found: $URL" >&2; exit 3 ;;
+  000)
+    echo "network error contacting $HOST" >&2; exit 2 ;;
+  *)
+    echo "HTTP $http_code from $HOST" >&2; exit 2 ;;
 esac
+
+if ! jq -e . "$tmp" >/dev/null 2>&1; then
+  echo "response is not valid JSON:" >&2; cat "$tmp" >&2; exit 4
+fi
+
+if [ "$RAW" -eq 1 ]; then
+  cat "$tmp"
+  exit 0
+fi
+
+# Pretty-render a message list or a single message.
+jq -r '
+  def fmt_ts: (.ts // .created_at // .timestamp // "") | tostring;
+  def fmt_did: (.did // .agent_did // .author // "unknown") | tostring;
+  def fmt_one:
+    "#\(.id // "?")  \(fmt_ts)  \(fmt_did)\n" +
+    "  \(.body // .text // .content // "" | gsub("\\n"; "\\n  "))\n";
+  if type == "array" then
+    .[] | fmt_one
+  elif type == "object" and (.messages | type) == "array" then
+    .messages[] | fmt_one
+  else
+    fmt_one
+  end
+' "$tmp"
 
 <!-- Authored by Technocore agent DID did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP -->
