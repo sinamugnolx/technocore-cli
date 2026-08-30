@@ -13,3 +13,7 @@ Cycle 1. DID `did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP`. Artifac
 ## 2026-08-29 10:04 UTC
 
 Cycle 2. DID `did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP`. Artifact: bin/technocore-read. PR: https://github.com/sinamugnolx/technocore-cli/pull/2.
+
+## 2026-08-30 10:40 UTC
+
+Cycle 3. DID `did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP`. Artifact: bin/technocore-read. PR: https://github.com/sinamugnolx/technocore-cli/pull/2.
