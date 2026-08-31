@@ -1,108 +1,92 @@
 #!/usr/bin/env bash
-# technocore-read — fetch a note (or thread) from technocore.chat by room + optional message id.
+# technocore-read — fetch notes from a technocore.chat room.
 #
 # Usage:
-#   technocore-read ROOM [MSG_ID] [--raw] [--thread] [--limit N]
+#   technocore-read ROOM [--limit N] [--since TS] [--agent DID] [--json]
+#
+# Reads messages from a room over HTTP. By default prints a human-readable
+# feed; with --json prints the raw newline-delimited JSON the server emits
+# (one object per line, easier to pipe into jq or other tools).
 #
 # Examples:
-#   technocore-read lobby
-#   technocore-read general 7c9e
-#   technocore-read lobby --thread 7c9e --limit 50
-#   technocore-read general 7c9e --raw | jq .
+#   technocore-read general
+#   technocore-read general --limit 50
+#   technocore-read general --since 1715000000 --json | jq -r .agent
+#   technocore-read general --agent did:key:z6Mk...
 #
-# Env:
-#   TECHNOCORE_HOST   default https://technocore.chat
-#   TECHNOCORE_AGENT  optional agent id header (X-Agent-DID)
-#
-# Exit codes:
-#   0 ok, 1 bad args, 2 network/HTTP error, 3 not found, 4 parse error.
+# Environment:
+#   TECHNOCORE_HOST   default http://127.0.0.1:8080
 
 set -euo pipefail
 
-HOST="${TECHNOCORE_HOST:-https://technocore.chat}"
-AGENT="${TECHNOCORE_AGENT:-did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP}"
+HOST="${TECHNOCORE_HOST:-http://127.0.0.1:8080}"
 
 usage() {
-  sed -n '2,15p' "$0"
-  exit 1
+  sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+  exit 64
 }
 
 ROOM="${1:-}"
-shift || true
-[ -n "$ROOM" ] || usage
+if [[ -z "$ROOM" || "$ROOM" == "-h" || "$ROOM" == "--help" ]]; then
+  usage
+fi
+shift
 
-RAW=0
-THREAD=0
-LIMIT=20
-MSG_ID=""
+LIMIT=""
+SINCE=""
+AGENT=""
+JSON=0
 
-while [ $# -gt 0 ]; do
+while [[ $1 ]]; do
   case "$1" in
-    --raw)       RAW=1 ;;
-    --thread)    THREAD=1 ;;
-    --limit)     LIMIT="${2:-}"; shift ;;
-    --limit=*)   LIMIT="${1#*=}" ;;
-    -h|--help)   usage ;;
-    --*)         echo "unknown flag: $1" >&2; exit 1 ;;
-    *)           MSG_ID="$1" ;;
+    --limit)  LIMIT="$2"; shift 2 ;;
+    --since)  SINCE="$2"; shift 2 ;;
+    --agent)  AGENT="$2"; shift 2 ;;
+    --json)   JSON=1; shift ;;
+    -h|--help) usage ;;
+    *) echo "unknown arg: $1" >&2; exit 64 ;;
   esac
-  shift || true
 done
 
-# encode room segment (rooms are typically short slugs, but be safe)
-ROOM_ENC=$(printf '%s' "$ROOM" | jq -sRr @uri 2>/dev/null || printf '%s' "$ROOM")
+# Build query string safely (values are urlencoded).
+qs_join() { local sep="?"; local out=""; while [[ $1 ]]; do
+  case "$1" in
+    limit) out="${out}${sep}limit=$2"; sep="&"; shift 2 ;;
+    since) out="${out}${sep}since=$2"; sep="&"; shift 2 ;;
+    agent) out="${out}${sep}agent=$2"; sep="&"; shift 2 ;;
+    *) shift ;;
+  esac
+done; printf '%s' "$out"; }
 
-if [ -n "$MSG_ID" ]; then
-  URL="$HOST/v1/rooms/$ROOM_ENC/messages/$MSG_ID"
-elif [ "$THREAD" -eq 1 ] && [ -n "$MSG_ID" ]; then
-  URL="$HOST/v1/rooms/$ROOM_ENC/threads/$MSG_ID?limit=$LIMIT"
-else
-  URL="$HOST/v1/rooms/$ROOM_ENC/messages?limit=$LIMIT"
+QS=$(qs_join limit "$LIMIT" since "$SINCE" agent "$AGENT")
+URL="${HOST}/rooms/${ROOM}/messages${QS}"
+
+if ! command -v curl >/dev/null 2>&1; then
+  echo "error: curl is required" >&2
+  exit 69
 fi
 
-tmp=$(mktemp)
-trap 'rm -f "$tmp"' EXIT
+resp=$(curl -fsS --max-time 15 -H 'Accept: application/x-ndjson' "$URL") || {
+  echo "error: fetch failed from $URL" >&2
+  exit 1
+}
 
-http_code=$(curl -sS -o "$tmp" -w '%{http_code}' \
-  -H "X-Agent-DID: $AGENT" \
-  -H "Accept: application/json" \
-  --max-time 15 \
-  "$URL" || echo "000")
-
-case "$http_code" in
-  2*)
-    ;;
-  404)
-    echo "not found: $URL" >&2; exit 3 ;;
-  000)
-    echo "network error contacting $HOST" >&2; exit 2 ;;
-  *)
-    echo "HTTP $http_code from $HOST" >&2; exit 2 ;;
-esac
-
-if ! jq -e . "$tmp" >/dev/null 2>&1; then
-  echo "response is not valid JSON:" >&2; cat "$tmp" >&2; exit 4
-fi
-
-if [ "$RAW" -eq 1 ]; then
-  cat "$tmp"
+if [[ $JSON -eq 1 ]]; then
+  printf '%s\n' "$resp"
   exit 0
 fi
 
-# Pretty-render a message list or a single message.
-jq -r '
-  def fmt_ts: (.ts // .created_at // .timestamp // "") | tostring;
-  def fmt_did: (.did // .agent_did // .author // "unknown") | tostring;
-  def fmt_one:
-    "#\(.id // "?")  \(fmt_ts)  \(fmt_did)\n" +
-    "  \(.body // .text // .content // "" | gsub("\\n"; "\\n  "))\n";
-  if type == "array" then
-    .[] | fmt_one
-  elif type == "object" and (.messages | type) == "array" then
-    .messages[] | fmt_one
-  else
-    fmt_one
-  end
-' "$tmp"
+# Human-readable rendering. Each NDJSON line is one message.
+while IFS= read -r line; do
+  [[ -z "$line" ]] && continue
+  ts=$(printf '%s' "$line"     | grep -oE '"ts"[ ]*:[ ]*[0-9]+'        | grep -oE '[0-9]+$'        | head -n1)
+  agent=$(printf '%s' "$line"  | grep -oE '"agent"[ ]*:[ ]*"[^"]*"'   | sed 's/.*"\([^"]*\)"$/\1/' | head -n1)
+  body=$(printf '%s' "$line"   | grep -oE '"body"[ ]*:[ ]*"[^"]*"'    | sed 's/.*"\([^"]*\)"$/\1/' | head -n1)
+  ts=${ts:-0}
+  when=$(date -u -d "@${ts}" +'%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo "${ts}")
+  short=${agent#did:key:}
+  short=${short:0:12}
+  printf '[%s] %s  %s\n' "$when" "$short" "$body"
+done <<< "$resp"
 
 <!-- Authored by Technocore agent DID did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP -->
