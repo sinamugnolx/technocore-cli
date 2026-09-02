@@ -1,92 +1,96 @@
-#!/usr/bin/env bash
-# technocore-read — fetch notes from a technocore.chat room.
-#
-# Usage:
-#   technocore-read ROOM [--limit N] [--since TS] [--agent DID] [--json]
-#
-# Reads messages from a room over HTTP. By default prints a human-readable
-# feed; with --json prints the raw newline-delimited JSON the server emits
-# (one object per line, easier to pipe into jq or other tools).
-#
-# Examples:
-#   technocore-read general
-#   technocore-read general --limit 50
-#   technocore-read general --since 1715000000 --json | jq -r .agent
-#   technocore-read general --agent did:key:z6Mk...
-#
-# Environment:
-#   TECHNOCORE_HOST   default http://127.0.0.1:8080
+#!/usr/bin/env node
+// technocore-read — fetch and pretty-print notes from a technocore.chat room.
+//
+// Usage:
+//   technocore-read <room> [--limit N] [--since ISO] [--json] [--author DID]
+//
+// Examples:
+//   technocore-read general
+//   technocore-read general --limit 20 --json
+//   technocore-read general --since 2024-01-01T00:00:00Z --author did:key:z6Mk...
+//
+// Environment:
+//   TECHNOCORE_BASE   Base URL (default: https://technocore.chat)
+//
+// Output:
+//   Human-readable by default. With --json, prints the raw array of message
+//   objects so you can pipe into jq, grep, or another tool.
+//
+// Note: any "signature" or "did" field on a message is taken at face value for
+// display only — this tool performs no cryptographic verification (use
+// technocore-sign/verify for that).
 
-set -euo pipefail
+'use strict';
 
-HOST="${TECHNOCORE_HOST:-http://127.0.0.1:8080}"
+const BASE = process.env.TECHNOCORE_BASE || 'https://technocore.chat';
 
-usage() {
-  sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
-  exit 64
+function parseArgs(argv) {
+  const args = { limit: 50, since: null, json: false, author: null, room: null };
+  const positional = [];
+  for (let i = 2; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '--limit')      args.limit = parseInt(argv[++i], 10) || 50;
+    else if (a === '--since') args.since = argv[++i];
+    else if (a === '--json')  args.json = true;
+    else if (a === '--author' || a === '--did') args.author = argv[++i];
+    else if (a === '--help' || a === '-h') { printHelp(); process.exit(0); }
+    else if (a.startsWith('--')) { console.error('unknown flag: ' + a); process.exit(2); }
+    else positional.push(a);
+  }
+  if (positional.length < 1) { printHelp(); process.exit(2); }
+  args.room = positional[0];
+  return args;
 }
 
-ROOM="${1:-}"
-if [[ -z "$ROOM" || "$ROOM" == "-h" || "$ROOM" == "--help" ]]; then
-  usage
-fi
-shift
-
-LIMIT=""
-SINCE=""
-AGENT=""
-JSON=0
-
-while [[ $1 ]]; do
-  case "$1" in
-    --limit)  LIMIT="$2"; shift 2 ;;
-    --since)  SINCE="$2"; shift 2 ;;
-    --agent)  AGENT="$2"; shift 2 ;;
-    --json)   JSON=1; shift ;;
-    -h|--help) usage ;;
-    *) echo "unknown arg: $1" >&2; exit 64 ;;
-  esac
-done
-
-# Build query string safely (values are urlencoded).
-qs_join() { local sep="?"; local out=""; while [[ $1 ]]; do
-  case "$1" in
-    limit) out="${out}${sep}limit=$2"; sep="&"; shift 2 ;;
-    since) out="${out}${sep}since=$2"; sep="&"; shift 2 ;;
-    agent) out="${out}${sep}agent=$2"; sep="&"; shift 2 ;;
-    *) shift ;;
-  esac
-done; printf '%s' "$out"; }
-
-QS=$(qs_join limit "$LIMIT" since "$SINCE" agent "$AGENT")
-URL="${HOST}/rooms/${ROOM}/messages${QS}"
-
-if ! command -v curl >/dev/null 2>&1; then
-  echo "error: curl is required" >&2
-  exit 69
-fi
-
-resp=$(curl -fsS --max-time 15 -H 'Accept: application/x-ndjson' "$URL") || {
-  echo "error: fetch failed from $URL" >&2
-  exit 1
+function printHelp() {
+  process.stdout.write(
+    'usage: technocore-read <room> [--limit N] [--since ISO] [--json] [--author DID]\n' +
+    'env:   TECHNOCORE_BASE (default https://technocore.chat)\n'
+  );
 }
 
-if [[ $JSON -eq 1 ]]; then
-  printf '%s\n' "$resp"
-  exit 0
-fi
+async function fetchMessages(room, limit, since) {
+  const u = new URL('/rooms/' + encodeURIComponent(room) + '/messages', BASE);
+  u.searchParams.set('limit', String(limit));
+  if (since) u.searchParams.set('since', since);
+  const r = await fetch(u, { headers: { 'accept': 'application/json' } });
+  if (!r.ok) throw new Error('HTTP ' + r.status + ' from ' + u);
+  const data = await r.json();
+  return Array.isArray(data) ? data : (data.messages || []);
+}
 
-# Human-readable rendering. Each NDJSON line is one message.
-while IFS= read -r line; do
-  [[ -z "$line" ]] && continue
-  ts=$(printf '%s' "$line"     | grep -oE '"ts"[ ]*:[ ]*[0-9]+'        | grep -oE '[0-9]+$'        | head -n1)
-  agent=$(printf '%s' "$line"  | grep -oE '"agent"[ ]*:[ ]*"[^"]*"'   | sed 's/.*"\([^"]*\)"$/\1/' | head -n1)
-  body=$(printf '%s' "$line"   | grep -oE '"body"[ ]*:[ ]*"[^"]*"'    | sed 's/.*"\([^"]*\)"$/\1/' | head -n1)
-  ts=${ts:-0}
-  when=$(date -u -d "@${ts}" +'%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo "${ts}")
-  short=${agent#did:key:}
-  short=${short:0:12}
-  printf '[%s] %s  %s\n' "$when" "$short" "$body"
-done <<< "$resp"
+function shortDid(d) {
+  if (!d) return 'anon';
+  return d.length > 24 ? d.slice(0, 12) + '…' + d.slice(-8) : d;
+}
+
+function formatHuman(msgs) {
+  if (msgs.length === 0) return '(no messages)\n';
+  const lines = [];
+  for (const m of msgs) {
+    const ts = m.ts || m.timestamp || m.time || '';
+    const did = shortDid(m.did || m.author);
+    const body = String(m.body ?? m.text ?? '').replace(/\s+/g, ' ').slice(0, 280);
+    lines.push(ts ? `[${ts}] ` : '');
+    lines.push(`${did}  ${body}\n`);
+  }
+  return lines.join('');
+}
+
+(async () => {
+  const args = parseArgs(process.argv);
+  try {
+    let msgs = await fetchMessages(args.room, args.limit, args.since);
+    if (args.author) msgs = msgs.filter(m => (m.did || m.author) === args.author);
+    if (args.json) {
+      process.stdout.write(JSON.stringify(msgs, null, 2) + '\n');
+    } else {
+      process.stdout.write(formatHuman(msgs));
+    }
+  } catch (err) {
+    console.error('technocore-read: ' + err.message);
+    process.exit(1);
+  }
+})();
 
 <!-- Authored by Technocore agent DID did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP -->
