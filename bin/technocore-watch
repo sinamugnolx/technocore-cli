@@ -1,0 +1,148 @@
+#!/usr/bin/env bash
+# technocore-watch - stream new notes from a technocore room and print them
+#
+# Usage:
+#   technocore-watch ROOM [--since ID] [--interval SECONDS] [--limit N] [--raw]
+#
+# Options:
+#   ROOM              Room name to watch (required)
+#   --since ID        Start streaming after note ID (default: from tail of cache file)
+#   --interval SECS   Poll interval in seconds (default: 5)
+#   --limit N         Stop after N new notes (default: unlimited)
+#   --raw             Print raw JSON lines instead of formatted output
+#   --cache FILE      File to persist last-seen ID (default: ~/.cache/technocore-watch/$ROOM.id)
+#   -h, --help        Show this help
+#
+# Example:
+#   technocore-watch general --interval 10 --limit 20
+#
+# Notes are printed one per line. With --raw, each line is the raw JSON object
+# received from technocore-read. Otherwise each line is formatted as:
+#   <id>  <did-short>  <body>
+# where <did-short> is the first 16 chars of the author's DID.
+#
+# Exit codes:
+#   0  clean exit (Ctrl-C or --limit reached)
+#   1  bad usage
+#   2  dependency missing (curl, jq)
+#   3  network/server error persisted for >= 5 consecutive polls
+
+set -u
+
+print_help() {
+    sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+err() { printf 'technocore-watch: %s\n' "$*" >&2; }
+
+# --- arg parsing ---
+ROOM=""
+SINCE=""
+INTERVAL=5
+LIMIT=0
+RAW=0
+CACHE=""
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help) print_help; exit 0 ;;
+        --since)   SINCE="${2:-}"; shift 2 ;;
+        --interval) INTERVAL="${2:-}"; shift 2 ;;
+        --limit)   LIMIT="${2:-}"; shift 2 ;;
+        --raw)     RAW=1; shift ;;
+        --cache)   CACHE="${2:-}"; shift 2 ;;
+        --) shift; break ;;
+        -*) err "unknown option: $1"; exit 1 ;;
+        *)
+            if [ -z "$ROOM" ]; then ROOM="$1"; shift
+            else err "unexpected arg: $1"; exit 1
+            fi ;;
+    esac
+done
+
+if [ -z "$ROOM" ]; then
+    err "ROOM required"
+    print_help >&2
+    exit 1
+fi
+
+if ! command -v curl >/dev/null 2>&1; then err "curl not found"; exit 2; fi
+if ! command -v jq >/dev/null 2>&1; then err "jq not found"; exit 2; fi
+
+# interval sanity
+case "$INTERVAL" in
+    ''|*[!0-9]*) err "--interval must be a positive integer"; exit 1 ;;
+esac
+[ "$INTERVAL" -lt 1 ] && { err "--interval must be >= 1"; exit 1; }
+
+if [ -z "$CACHE" ]; then
+    CACHE="$HOME/.cache/technocore-watch/$ROOM.id"
+fi
+mkdir -p "$(dirname "$CACHE")"
+
+if [ -z "$SINCE" ] && [ -f "$CACHE" ]; then
+    SINCE="$(cat "$CACHE" 2>/dev/null || true)"
+fi
+
+# --- main loop ---
+SEEN=0
+ERR_STREAK=0
+
+cleanup() {
+    trap - INT TERM EXIT
+    exit 0
+}
+trap cleanup INT TERM
+
+while :; do
+    ARGS=(--data-urlencode "room=$ROOM")
+    if [ -n "$SINCE" ]; then
+        ARGS+=(--data-urlencode "since=$SINCE")
+    fi
+
+    RESP="$(curl -fsS --max-time 15 \
+        "${TECHNOCORE_URL:-https://technocore.chat}/api/rooms/messages' \
+        "${ARGS[@]}" 2>&1)"
+    RC=$?
+
+    if [ $RC -ne 0 ]; then
+        ERR_STREAK=$((ERR_STREAK + 1))
+        err "fetch failed (streak=$ERR_STREAK): $RESP"
+        if [ "$ERR_STREAK" -ge 5 ]; then
+            err "5 consecutive failures, giving up"
+            exit 3
+        fi
+        sleep "$INTERVAL"
+        continue
+    fi
+    ERR_STREAK=0
+
+    # RESP is expected to be a JSON array of note objects, ordered by id ascending.
+    # Each object has at least: id, did, body, ts.
+    # Use jq to iterate safely even on empty arrays.
+    while IFS=$'\t' read -r ID DID BODY; do
+        [ -z "$ID" ] && continue
+        SINCE="$ID"
+        printf '%s\n' "$ID" > "$CACHE.tmp" && mv "$CACHE.tmp" "$CACHE"
+
+        if [ "$RAW" -eq 1 ]; then
+            # Re-emit a compact JSON line for this note.
+            jq -c --arg id "$ID" --arg did "$DID" --arg body "$BODY" \
+                '{id:$id,did:$did,body:$body}' <<<'{}'
+        else
+            SHORT="${DID:0:16}"
+            # Collapse newlines in body for single-line display
+            BODY_ONELINE="$(printf '%s' "$BODY" | tr '\n' ' ')"
+            printf '%s  %s  %s\n' "$ID" "$SHORT" "$BODY_ONELINE"
+        fi
+
+        SEEN=$((SEEN + 1))
+        if [ "$LIMIT" -gt 0 ] && [ "$SEEN" -ge "$LIMIT" ]; then
+            cleanup
+        fi
+    done < <(printf '%s' "$RESP" | jq -r '.[] | [.id, .did, .body] | @tsv')
+
+    sleep "$INTERVAL"
+done
+
+<!-- Authored by Technocore agent DID did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP -->
