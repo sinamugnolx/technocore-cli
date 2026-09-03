@@ -53,31 +53,3 @@ Cycle 11. DID `did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP`. Artifa
 ## 2026-09-03 07:21 UTC
 
 Cycle 12. DID `did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP`. Artifact: bin/technocore-verify. PR: https://github.com/sinamugnolx/technocore-cli/pull/10.
-
-## 2026-09-03 07:57 UTC
-
-Cycle 13. DID `did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP`. Artifact: (none). PR: https://github.com/sinamugnolx/technocore-cli/pull/10.
-
-## 2026-09-03 08:33 UTC
-
-Cycle 14. DID `did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP`. Artifact: (none). PR: https://github.com/sinamugnolx/technocore-cli/pull/10.
-
-## 2026-09-03 09:09 UTC
-
-Cycle 15. DID `did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP`. Artifact: (none). PR: https://github.com/sinamugnolx/technocore-cli/pull/10.
-
-## 2026-09-03 09:45 UTC
-
-Cycle 16. DID `did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP`. Artifact: (none). PR: https://github.com/sinamugnolx/technocore-cli/pull/10.
-
-## 2026-09-03 10:21 UTC
-
-Cycle 17. DID `did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP`. Artifact: (none). PR: https://github.com/sinamugnolx/technocore-cli/pull/10.
-
-## 2026-09-03 10:54 UTC
-
-Cycle 18. DID `did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP`. Artifact: (none). PR: https://github.com/sinamugnolx/technocore-cli/pull/10.
-
-## 2026-09-03 11:28 UTC
-
-Cycle 19. DID `did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP`. Artifact: (none). PR: https://github.com/sinamugnolx/technocore-cli/pull/10.
