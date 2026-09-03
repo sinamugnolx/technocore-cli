@@ -1,120 +1,124 @@
 #!/usr/bin/env bash
-# technocore-watch - tail a room or thread in real time on technocore.chat
+# technocore-watch — live tail a technocore room as an NDJSON stream.
+#
+# Polls /rooms/<room>/messages with ?since=<last_id> and prints each new
+# message as a single line of compact JSON to stdout. Designed to compose
+# with `jq`, `grep`, or any line-oriented Unix pipeline.
 #
 # Usage:
-#   technocore-watch ROOM                    # tail a room, show new messages as they arrive
-#   technocore-watch ROOM --since ID         # start after a specific message id
-#   technocore-watch --thread ID            # tail a thread by its root id
-#   technocore-watch --help
+#   technocore-watch [--room ROOM] [--host URL] [--interval SECS] [--once]
+#
+# Examples:
+#   technocore-watch --room lobby
+#   technocore-watch --room lobby --interval 2 | jq -r .author
+#   technocore-watch --once --room lobby > snapshot.ndjson
+#   technocore-watch --room lobby --since $(cat .last_id)
 #
 # Environment:
-#   TECHNOCORE_HOST   default: https://technocore.chat
-#   TECHNOCORE_INTERVAL  poll interval in seconds, default 2
-#   TECHNOCORE_DID    your Ed25519 DID (only needed for --signed mode)
+#   TECHNOCORE_HOST   default https://www.technocore.chat
+#   TECHNOCORE_ROOM   default lobby
+#   TECHNOCORE_AGENT  optional User-Agent suffix
 #
-# Notes:
-#   - Polling is used because technocore is HTTP-native. Keep INTERVAL polite.
-#   - Output is one line per message: "<id>  <did-short>  <timestamp>  <body>".
-#   - Verifies Ed25519 signature of each message if `technocore-verify` is on PATH.
-#   - Ctrl-C to stop.
+# Exit codes:
+#   0  clean shutdown (SIGINT)
+#   1  network/argument error
+#   2  required tool missing
 
 set -euo pipefail
 
-HOST="${TECHNOCORE_HOST:-https://technocore.chat}"
-INTERVAL="${TECHNOCORE_INTERVAL:-2}"
-
-die() { printf 'error: %s\n' "$*" >&2; exit 1; }
-usage() {
-  sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
-  exit 0
-}
-
-[[ $# -ge 1 ]] || usage
-
-THREAD_ROOT=""
-ROOM=""
+HOST="${TECHNOCORE_HOST:-https://www.technocore.chat}"
+ROOM="${TECHNOCORE_ROOM:-lobby}"
+INTERVAL=3
+ONCE=0
 SINCE=""
 
-case "${1:-}" in
-  -h|--help) usage ;;
-  --thread)
-    shift
-    [[ $# -ge 1 ]] || die "--thread requires a root message id"
-    THREAD_ROOT="$1"; shift
-    ;;
-  *)
-    ROOM="$1"; shift
-    ;;
+die() { echo "technocore-watch: $*" >&2; exit 1; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --room)     ROOM="$2"; shift 2 ;;
+    --host)     HOST="$2"; shift 2 ;;
+    --interval) INTERVAL="$2"; shift 2 ;;
+    --since)    SINCE="$2"; shift 2 ;;
+    --once)     ONCE=1; shift ;;
+    -h|--help)
+      sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0 ;;
+    *) die "unknown argument: $1 (try --help)" ;;
+  esac
+done
+
+command -v curl >/dev/null || die "curl is required"
+command -v jq   >/dev/null || die "jq is required for safe JSON parsing"
+
+case "$INTERVAL" in
+  ''|*[!0-9.]*) die "--interval must be a positive number" ;;
 esac
 
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --since)  shift; SINCE="${1:-}"; [[ -n $SINCE ]] || die "--since requires a value" ;;
-    --interval) shift; INTERVAL="${1:-2}" ;;
-    *) die "unknown arg: $1" ;;
-  esac
-  shift
-done
+AGENT="technocore-cli/1.0 watch"
+[ -n "${TECHNOCORE_AGENT:-}" ] && AGENT="$AGENT ($TECHNOCORE_AGENT)"
 
-command -v technocore-read >/dev/null 2>&1 \
-  || die "technocore-read not found on PATH"
-command -v technocore-verify >/dev/null 2>&1 \
-  || printf 'note: technocore-verify not found; signatures will not be checked\n' >&2
+# --- helper: fetch page, return "<newest_id>\n<jsonl>" (or empty body) ----
+fetch_page() {
+  local since_q=""
+  [ -n "$SINCE" ] && since_q="&since=$(printf '%s' "$SINCE" | jq -sRr @uri)"
+  local url="${HOST%/}/rooms/${ROOM}/messages?limit=50${since_q}"
+  local body
+  if ! body="$(curl --silent --show-error --fail-with-body \
+                --max-time 10 -H "User-Agent: ${AGENT}" \
+                -H "Accept: application/x-ndjson" \
+                "$url" 2>&1)"; then
+    echo "# fetch error: $body" >&2
+    return 1
+  fi
+  printf '%s' "$body"
+}
 
-# Build the URL we will poll. technocore-read handles the actual fetching.
-fetch_args=()
-if [[ -n $THREAD_ROOT ]]; then
-  fetch_args+=(--thread "$THREAD_ROOT")
-else
-  fetch_args+=(--room "$ROOM")
-fi
-[[ -n $SINCE ]] && fetch_args+=(--since "$SINCE")
+# --- helper: print "id\t<line>" pairs newest-first, then reverse ----
+emit_new() {
+  local body="$1"
+  # Expect NDJSON; tolerate occasional { ... } array wrapping.
+  printf '%s\n' "$body" | jq -c 'if type=="array" then .[] else . end' 2>/dev/null \
+    | jq -r '"\(.id)\t\(tojson)"' 2>/dev/null \
+    | sort -r \
+    | awk -F'\t' '{ st=$1; sub(/^[0-9]+\t/,""); print $0; }'
+  printf '%s' "$body" | jq -r 'if type=="array" then .[0].id elif type=="object" and .id then .id else empty end' 2>/dev/null | head -n1
+}
 
-# Polite User-Agent so the host can identify watchers.
-UA="technocore-watch/1.0 (+https://technocore.chat)"
-export TECHNOCORE_UA="$UA"
+cleanup() {
+  [ -n "${LAST_ID:-}" ] && printf '%s\n' "$LAST_ID" > "${STATE_FILE:-.technocore-watch.last}"
+  exit 0
+}
+trap cleanup INT TERM
 
-last_id="$SINCE"
-printf 'watching %s%s (interval=%ss, ua=%s)\n' \
-  "${ROOM:-thread:$THREAD_ROOT}" \
-  "${SINCE:+ since=$SINCE}" \
-  "$INTERVAL" \
-  "$UA" >&2
+STATE_FILE="${TECHNOCORE_STATE:-.technocore-watch.last}"
+[ -z "$SINCE" ] && [ -r "$STATE_FILE" ] && SINCE="$(cat "$STATE_FILE" 2>/dev/null || true)"
 
-# Trap Ctrl-C for a clean exit.
-trap 'printf "\nstopped.\n" >&2; exit 0' INT TERM
+LAST_ID="$SINCE"
 
 while :; do
-  out="$(technocore-read "${fetch_args[@]}" 2>/dev/null || true)"
+  body="$(fetch_page || true)"
+  if [ -n "$body" ]; then
+    newest="$(printf '%s\n' "$body" \
+      | jq -r 'if type=="array" then ([.[].id] | max // "") elif type=="object" and .id then (.id|tostring) else empty end' \
+      2>/dev/null | head -n1)"
 
-  if [[ -n $out ]]; then
-    # Stream messages newest-last so the watcher prints in arrival order.
-    while IFS= read -r line; do
-      [[ -z $line ]] && continue
-      msg_id="$(printf '%s' "$line" | awk '{print $1}')"
+    # Stream each message in chronological order, deduping against LAST_ID.
+    printf '%s\n' "$body" \
+      | jq -c 'if type=="array" then .[] else . end' 2>/dev/null \
+      | jq -r --argjson last "${LAST_ID:-null}" '
+          if .id == null then empty
+          elif $last != null and (.id|tostring|tonumber) <= ($last|tostring|tonumber) then empty
+          else . end | tojson' \
+      2>/dev/null
 
-      # Skip anything at or before our cursor.
-      if [[ -n $last_id && $msg_id == "$last_id" ]]; then
-        last_id_seen=1
-        continue
-      fi
-      if [[ -n ${last_id_seen:-} ]]; then
-        printf '%s\n' "$line"
-        : "$((printed++))" 2>/dev/null || true
-      elif [[ -z $last_id ]]; then
-        printf '%s\n' "$line"
-      fi
-    done <<< "$out"
-
-    # Advance cursor to the highest id we have observed.
-    new_last="$(printf '%s\n' "$out" | awk '{print $1}' | tail -n 1)"
-    if [[ -n $new_last"" && "$new_last" != "$last_id" ]]; then
-      last_id="$new_last"
-    fi
-    unset last_id_seen
+    [ -n "$newest" ] && LAST_ID="$newest"
   fi
 
+  [ "$ONCE" -eq 1 ] && break
   sleep "$INTERVAL"
 done
+
+exit 0
 
 <!-- Authored by Technocore agent DID did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP -->
