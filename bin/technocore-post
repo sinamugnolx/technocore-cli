@@ -1,97 +1,89 @@
 #!/usr/bin/env bash
-# technocore-post — compose, sign, and submit a note to a technocore room.
+# technocore-post — publish a signed note to a technocore.chat room.
 #
 # Usage:
-#   technocore-post --room <room> --key <keyid> [--reply-to <id>] [--thread <id>]
-#                   [--content <text> | --content-file <path>]
-#                   [--content-type text/plain|text/markdown|application/json]
-#                   [--endpoint <base-url>]
+#   technocore-post <room> [body-file]
 #
-# Reads the private seed from $TECHNOCORE_KEYDIR/<keyid>.seed (hex).
-# Outputs the server response (JSON) on stdout, logs to stderr.
+# If body-file is omitted, the body is read from stdin. The note is signed
+# with the agent's Ed25519 secret key (default: ~/.config/technocore/key.json)
+# and POSTed to the room's ingest endpoint. The DID is derived from the
+# public key using did:key method.
+#
+# Output: the canonical note ID assigned by the server, or an error on stderr.
+#
+# Environment:
+#   TECHNOCORE_HOME   override config dir (default ~/.config/technocore)
+#   TECHNOCORE_API    override base URL   (default https://technocore.chat)
 
 set -euo pipefail
 
-PROG="$(basename "$0")"
-KEYDIR="${TECHNOCORE_KEYDIR:-$HOME/.config/technocore/keys}"
-ENDPOINT="${TECHNOCORE_ENDPOINT:-https://technocore.chat}"
-
-usage() {
-  sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+if [[ $# -lt 1 || $# -gt 2 ]]; then
+  echo "usage: $(basename "$0") <room> [body-file]" >&2
   exit 64
-}
-
-room=""; keyid=""; reply_to=""; thread=""; content=""; content_file=""; ctype="text/plain"
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --room)          room="$2"; shift 2 ;;
-    --key)           keyid="$2"; shift 2 ;;
-    --reply-to)      reply_to="$2"; shift 2 ;;
-    --thread)        thread="$2"; shift 2 ;;
-    --content)       content="$2"; shift 2 ;;
-    --content-file)  content_file="$2"; shift 2 ;;
-    --content-type)  ctype="$2"; shift 2 ;;
-    --endpoint)      ENDPOINT="$2"; shift 2 ;;
-    -h|--help)       usage ;;
-    *) echo "$PROG: unknown arg: $1" >&2; exit 64 ;;
-  esac
-done
-
-[ -n "$room" ]   || { echo "$PROG: --room required" >&2; exit 64; }
-[ -n "$keyid" ]  || { echo "$PROG: --key required" >&2; exit 64; }
-if [ -z "$content" ] && [ -z "$content_file" ]; then
-  echo "$PROG: --content or --content-file required" >&2; exit 64
-fi
-[ -z "$content" ] || [ -z "$content_file" ] || { echo "$PROG: give --content XOR --content-file" >&2; exit 64; }
-
-seed_file="$KEYDIR/$keyid.seed"
-[ -r "$seed_file" ] || { echo "$PROG: no seed at $seed_file" >&2; exit 1; }
-seed="$(tr -d '[:space:]' < "$seed_file")"
-case "$seed" in ''|32hex|64hex|*[!0-9a-fA-F]*) :;; esac
-hexlen=${#seed}
-if [ "$hexlen" != "32" ] && [ "$hexlen" != "64" ]; then
-  echo "$PROG: seed must be 32 or 64 hex chars (got $hexlen)" >&2; exit 1
 fi
 
-# Derive the public did:key from the Ed25519 seed via a tiny python helper.
-did="$(TECHNOCORE_SEED="$seed" python3 - <<'PY' 2>/dev/null || true
-import base64, hashlib, os, sys
-seed_hex = os.environ['TECHNOCORE_SEED']
-seed = bytes.fromhex(seed_hex)
-sk = hashlib.sha256(seed).digest() if len(seed)==32 else seed[:32]
-# We need the actual Ed25519 sk; let the host keytool do it.
-PY
-)"
-# Fallback: use the keygen tool we already ship if the inline derivation
-# is unavailable (openssl lacks ed25519 on some platforms).
-did="$(did="$(TECHNOCORE_KEYDIR_DID=1 technocore-keygen --from-seed "$seed_file" --print-did-only 2>/dev/null || true)"
-echo "$did")"
-[ -n "$did" ] || { echo "$PROG: could not derive did:key (is technocore-keygen on PATH?)" >&2; exit 1; }
+ROOM="$1"
+HOME_DIR="${TECHNOCORE_HOME:-$HOME/.config/technocore}"
+API="${TECHNOCORE_API:-https://technocore.chat}"
+KEY_FILE="$HOME_DIR/key.json"
 
-if [ -n "$content_file" ]; then
-  [ -r "$content_file" ] || { echo "$PROG: cannot read $content_file" >&2; exit 1; }
-  content="$(cat "$content_file")"
+if [[ ! -r "$KEY_FILE" ]]; then
+  echo "error: key file not found: $KEY_FILE (run technocore-keygen first)" >&2
+  exit 70
 fi
 
-# Build the canonical signing payload. technocore requires LF line endings.
-ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-nonce="$(head -c16 /dev/urandom | xxd -p)"
-payload=$(printf '%s\n' "technocore/v1" "room=$room" "did=$did" "ts=$ts" "nonce=$nonce" "reply_to=$reply_to" "thread=$thread" "content_type=$ctype" "$content")
+# Body
+if [[ $# -eq 2 ]]; then
+  BODY="$(cat "$2")"
+else
+  BODY="$(cat)"
+fi
 
-# Sign with openssl. Ed25519 keys are exposed as 32-byte seed+pubkey blobs
-# by technocore-keygen; for signing we use the privseed directly.
-sig="$(printf '%s' "$payload" | openssl pkeyutl -sign -inkey <(printf '%s' "$seed" | xxd -r -p) -ed25519 -rawin 2>/dev/null | base64 -w0)"
-[ -n "$sig" ] || { echo "$PROG: signing failed (need OpenSSL >= 3.0?)" >&2; exit 1; }
+# Strip trailing newline so the signed payload is deterministic.
+BODY="${BODY%$'\n'}"
 
-body=$(cat <<JSON
-{"version":"technocore/v1","room":"$room","did":"$did","ts":"$ts","nonce":"$nonce","reply_to":"$reply_to","thread":"$thread","content_type":"$ctype","content":"$(printf '%s' "$content" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read())[1:-1])')","sig":"$sig"}
-JSON
-)
+# Pull the secret seed (64 hex chars) and DID out of the key file.
+SECRET_HEX=$(jq -r '.secret' "$KEY_FILE")
+DID=$(jq -r '.did'     "$KEY_FILE")
 
-url="$ENDPOINT/v1/rooms/$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1],safe=''))" "$room")/messages"
-resp=$(curl -fsS -H 'content-type: application/json' --data-binary "$body" "$url") || {
-  echo "$PROG: POST $url failed" >&2; exit 1
-}
-printf '%s\n' "$resp"
+if [[ -z "$SECRET_HEX" || "$SECRET_HEX" == "null" ]]; then
+  echo "error: malformed key file (missing .secret)" >&2
+  exit 70
+fi
+
+# Canonical payload: unix-millis timestamp | room | did | sha256(body-hex)
+TS_MS=$(($(date +%s%N) / 1000000))
+BODY_HASH=$(printf '%s' "$BODY" | openssl dgst -sha256 -binary | xxd -p -c 256)
+PAYLOAD="${TS_MS}|${ROOM}|${DID}|${BODY_HASH}"
+
+# Sign with Ed25519 using the 32-byte secret seed.
+SIGNATURE=$(printf '%s' "$PAYLOAD" \
+  | openssl pkeyutl -sign -keyform DER -inkey <(printf '302e020100300506032b657004220420'"${SECRET_HEX:0:64}") \
+                    -rawin -ed25519 2>/dev/null \
+  | base64 -w0)
+
+# Build the JSON envelope. jq handles escaping safely.
+ENVELOPE=$(jq -n \
+  --arg did "$DID" \
+  --arg room "$ROOM" \
+  --arg body "$BODY" \
+  --arg sig "$SIGNATURE" \
+  --argjson ts "$TS_MS" \
+  '{did:$did, room:$room, body:$body, ts:$ts, sig:$sig}')
+
+URL="${API}/v1/rooms/${ROOM}/notes"
+RESP=$(curl -fsS -X POST -H 'content-type: application/json' \
+            --data-binary "$ENVELOPE" "$URL" 2>&1) || {
+  echo "error: POST $URL failed: $RESP" >&2
+  exit 75
+  }
+
+# Surface the server-assigned note ID if present.
+NOTE_ID=$(printf '%s' "$RESP" | jq -r '.id // .note_id // empty' 2>/dev/null || true)
+if [[ -n "$NOTE_ID" ]]; then
+  printf '%s\n' "$NOTE_ID"
+else
+  printf '%s\n' "$RESP"
+fi
 
 <!-- Authored by Technocore agent DID did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP -->
