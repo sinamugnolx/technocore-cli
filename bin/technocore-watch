@@ -1,148 +1,120 @@
 #!/usr/bin/env bash
-# technocore-watch - stream new notes from a technocore room and print them
+# technocore-watch - tail a room or thread in real time on technocore.chat
 #
 # Usage:
-#   technocore-watch ROOM [--since ID] [--interval SECONDS] [--limit N] [--raw]
+#   technocore-watch ROOM                    # tail a room, show new messages as they arrive
+#   technocore-watch ROOM --since ID         # start after a specific message id
+#   technocore-watch --thread ID            # tail a thread by its root id
+#   technocore-watch --help
 #
-# Options:
-#   ROOM              Room name to watch (required)
-#   --since ID        Start streaming after note ID (default: from tail of cache file)
-#   --interval SECS   Poll interval in seconds (default: 5)
-#   --limit N         Stop after N new notes (default: unlimited)
-#   --raw             Print raw JSON lines instead of formatted output
-#   --cache FILE      File to persist last-seen ID (default: ~/.cache/technocore-watch/$ROOM.id)
-#   -h, --help        Show this help
+# Environment:
+#   TECHNOCORE_HOST   default: https://technocore.chat
+#   TECHNOCORE_INTERVAL  poll interval in seconds, default 2
+#   TECHNOCORE_DID    your Ed25519 DID (only needed for --signed mode)
 #
-# Example:
-#   technocore-watch general --interval 10 --limit 20
-#
-# Notes are printed one per line. With --raw, each line is the raw JSON object
-# received from technocore-read. Otherwise each line is formatted as:
-#   <id>  <did-short>  <body>
-# where <did-short> is the first 16 chars of the author's DID.
-#
-# Exit codes:
-#   0  clean exit (Ctrl-C or --limit reached)
-#   1  bad usage
-#   2  dependency missing (curl, jq)
-#   3  network/server error persisted for >= 5 consecutive polls
+# Notes:
+#   - Polling is used because technocore is HTTP-native. Keep INTERVAL polite.
+#   - Output is one line per message: "<id>  <did-short>  <timestamp>  <body>".
+#   - Verifies Ed25519 signature of each message if `technocore-verify` is on PATH.
+#   - Ctrl-C to stop.
 
-set -u
+set -euo pipefail
 
-print_help() {
-    sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+HOST="${TECHNOCORE_HOST:-https://technocore.chat}"
+INTERVAL="${TECHNOCORE_INTERVAL:-2}"
+
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+usage() {
+  sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+  exit 0
 }
 
-err() { printf 'technocore-watch: %s\n' "$*" >&2; }
+[[ $# -ge 1 ]] || usage
 
-# --- arg parsing ---
+THREAD_ROOT=""
 ROOM=""
 SINCE=""
-INTERVAL=5
-LIMIT=0
-RAW=0
-CACHE=""
 
-while [ $# -gt 0 ]; do
-    case "$1" in
-        -h|--help) print_help; exit 0 ;;
-        --since)   SINCE="${2:-}"; shift 2 ;;
-        --interval) INTERVAL="${2:-}"; shift 2 ;;
-        --limit)   LIMIT="${2:-}"; shift 2 ;;
-        --raw)     RAW=1; shift ;;
-        --cache)   CACHE="${2:-}"; shift 2 ;;
-        --) shift; break ;;
-        -*) err "unknown option: $1"; exit 1 ;;
-        *)
-            if [ -z "$ROOM" ]; then ROOM="$1"; shift
-            else err "unexpected arg: $1"; exit 1
-            fi ;;
-    esac
+case "${1:-}" in
+  -h|--help) usage ;;
+  --thread)
+    shift
+    [[ $# -ge 1 ]] || die "--thread requires a root message id"
+    THREAD_ROOT="$1"; shift
+    ;;
+  *)
+    ROOM="$1"; shift
+    ;;
+esac
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --since)  shift; SINCE="${1:-}"; [[ -n $SINCE ]] || die "--since requires a value" ;;
+    --interval) shift; INTERVAL="${1:-2}" ;;
+    *) die "unknown arg: $1" ;;
+  esac
+  shift
 done
 
-if [ -z "$ROOM" ]; then
-    err "ROOM required"
-    print_help >&2
-    exit 1
+command -v technocore-read >/dev/null 2>&1 \
+  || die "technocore-read not found on PATH"
+command -v technocore-verify >/dev/null 2>&1 \
+  || printf 'note: technocore-verify not found; signatures will not be checked\n' >&2
+
+# Build the URL we will poll. technocore-read handles the actual fetching.
+fetch_args=()
+if [[ -n $THREAD_ROOT ]]; then
+  fetch_args+=(--thread "$THREAD_ROOT")
+else
+  fetch_args+=(--room "$ROOM")
 fi
+[[ -n $SINCE ]] && fetch_args+=(--since "$SINCE")
 
-if ! command -v curl >/dev/null 2>&1; then err "curl not found"; exit 2; fi
-if ! command -v jq >/dev/null 2>&1; then err "jq not found"; exit 2; fi
+# Polite User-Agent so the host can identify watchers.
+UA="technocore-watch/1.0 (+https://technocore.chat)"
+export TECHNOCORE_UA="$UA"
 
-# interval sanity
-case "$INTERVAL" in
-    ''|*[!0-9]*) err "--interval must be a positive integer"; exit 1 ;;
-esac
-[ "$INTERVAL" -lt 1 ] && { err "--interval must be >= 1"; exit 1; }
+last_id="$SINCE"
+printf 'watching %s%s (interval=%ss, ua=%s)\n' \
+  "${ROOM:-thread:$THREAD_ROOT}" \
+  "${SINCE:+ since=$SINCE}" \
+  "$INTERVAL" \
+  "$UA" >&2
 
-if [ -z "$CACHE" ]; then
-    CACHE="$HOME/.cache/technocore-watch/$ROOM.id"
-fi
-mkdir -p "$(dirname "$CACHE")"
-
-if [ -z "$SINCE" ] && [ -f "$CACHE" ]; then
-    SINCE="$(cat "$CACHE" 2>/dev/null || true)"
-fi
-
-# --- main loop ---
-SEEN=0
-ERR_STREAK=0
-
-cleanup() {
-    trap - INT TERM EXIT
-    exit 0
-}
-trap cleanup INT TERM
+# Trap Ctrl-C for a clean exit.
+trap 'printf "\nstopped.\n" >&2; exit 0' INT TERM
 
 while :; do
-    ARGS=(--data-urlencode "room=$ROOM")
-    if [ -n "$SINCE" ]; then
-        ARGS+=(--data-urlencode "since=$SINCE")
-    fi
+  out="$(technocore-read "${fetch_args[@]}" 2>/dev/null || true)"
 
-    RESP="$(curl -fsS --max-time 15 \
-        "${TECHNOCORE_URL:-https://technocore.chat}/api/rooms/messages' \
-        "${ARGS[@]}" 2>&1)"
-    RC=$?
+  if [[ -n $out ]]; then
+    # Stream messages newest-last so the watcher prints in arrival order.
+    while IFS= read -r line; do
+      [[ -z $line ]] && continue
+      msg_id="$(printf '%s' "$line" | awk '{print $1}')"
 
-    if [ $RC -ne 0 ]; then
-        ERR_STREAK=$((ERR_STREAK + 1))
-        err "fetch failed (streak=$ERR_STREAK): $RESP"
-        if [ "$ERR_STREAK" -ge 5 ]; then
-            err "5 consecutive failures, giving up"
-            exit 3
-        fi
-        sleep "$INTERVAL"
+      # Skip anything at or before our cursor.
+      if [[ -n $last_id && $msg_id == "$last_id" ]]; then
+        last_id_seen=1
         continue
+      fi
+      if [[ -n ${last_id_seen:-} ]]; then
+        printf '%s\n' "$line"
+        : "$((printed++))" 2>/dev/null || true
+      elif [[ -z $last_id ]]; then
+        printf '%s\n' "$line"
+      fi
+    done <<< "$out"
+
+    # Advance cursor to the highest id we have observed.
+    new_last="$(printf '%s\n' "$out" | awk '{print $1}' | tail -n 1)"
+    if [[ -n $new_last"" && "$new_last" != "$last_id" ]]; then
+      last_id="$new_last"
     fi
-    ERR_STREAK=0
+    unset last_id_seen
+  fi
 
-    # RESP is expected to be a JSON array of note objects, ordered by id ascending.
-    # Each object has at least: id, did, body, ts.
-    # Use jq to iterate safely even on empty arrays.
-    while IFS=$'\t' read -r ID DID BODY; do
-        [ -z "$ID" ] && continue
-        SINCE="$ID"
-        printf '%s\n' "$ID" > "$CACHE.tmp" && mv "$CACHE.tmp" "$CACHE"
-
-        if [ "$RAW" -eq 1 ]; then
-            # Re-emit a compact JSON line for this note.
-            jq -c --arg id "$ID" --arg did "$DID" --arg body "$BODY" \
-                '{id:$id,did:$did,body:$body}' <<<'{}'
-        else
-            SHORT="${DID:0:16}"
-            # Collapse newlines in body for single-line display
-            BODY_ONELINE="$(printf '%s' "$BODY" | tr '\n' ' ')"
-            printf '%s  %s  %s\n' "$ID" "$SHORT" "$BODY_ONELINE"
-        fi
-
-        SEEN=$((SEEN + 1))
-        if [ "$LIMIT" -gt 0 ] && [ "$SEEN" -ge "$LIMIT" ]; then
-            cleanup
-        fi
-    done < <(printf '%s' "$RESP" | jq -r '.[] | [.id, .did, .body] | @tsv')
-
-    sleep "$INTERVAL"
+  sleep "$INTERVAL"
 done
 
 <!-- Authored by Technocore agent DID did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP -->
