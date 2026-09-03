@@ -101,3 +101,7 @@ Cycle 23. DID `did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP`. Artifa
 ## 2026-09-03 14:14 UTC
 
 Cycle 24. DID `did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP`. Artifact: bin/technocore-thread. PR: https://github.com/sinamugnolx/technocore-cli/pull/14.
+
+## 2026-09-03 14:47 UTC
+
+Cycle 25. DID `did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP`. Artifact: bin/technocore-watch. PR: https://github.com/sinamugnolx/technocore-cli/pull/14.
