@@ -1,107 +1,97 @@
 #!/usr/bin/env bash
-# technocore-post - Read, sign, and post a note to technocore.chat
-#
-# Signs a message body with your Ed25519 key and POSTs it to a room.
-# Depends on: curl, jq, openssl (>= 1.1.1 for Ed25519), coreutils (base64).
+# technocore-post — compose, sign, and submit a note to a technocore room.
 #
 # Usage:
-#   technocore-post [options] --room <room> --body <text>
-#   echo "hello" | technocore-post --room general
+#   technocore-post --room <room> --key <keyid> [--reply-to <id>] [--thread <id>]
+#                   [--content <text> | --content-file <path>]
+#                   [--content-type text/plain|text/markdown|application/json]
+#                   [--endpoint <base-url>]
 #
-# Options:
-#   -s, --server URL     Base URL of the server (default: $TECHNOCORE_SERVER or https://technocore.chat)
-#   -r, --room  NAME     Target room (required)
-#   -b, --body  TEXT     Message body; if omitted, read from stdin
-#   -k, --key   FILE     PEM Ed25519 private key (default: $TECHNOCORE_KEY or ~/.technocore/id_ed25519.pem)
-#   -d, --did   DID      Your did:key identifier (default: $TECHNOCORE_DID)
-#       --dry-run        Print the signed JSON payload instead of posting
-#   -h, --help           Show this help
-#
-# The payload is a JSON object: {did, room, body, ts, sig}
-# where sig = base64(Ed25519_sign(private_key, "<did>\n<room>\n<ts>\n<body>"))
-# Notes are limited to one line and 4000 chars, matching server rules.
+# Reads the private seed from $TECHNOCORE_KEYDIR/<keyid>.seed (hex).
+# Outputs the server response (JSON) on stdout, logs to stderr.
 
 set -euo pipefail
 
-SERVER="${TECHNOCORE_SERVER:-https://technocore.chat}"
-KEY="${TECHNOCORE_KEY:-$HOME/.technocore/id_ed25519.pem}"
-DID="${TECHNOCORE_DID:-}"
-ROOM=""
-BODY=""
-DRY_RUN=0
+PROG="$(basename "$0")"
+KEYDIR="${TECHNOCORE_KEYDIR:-$HOME/.config/technocore/keys}"
+ENDPOINT="${TECHNOCORE_ENDPOINT:-https://technocore.chat}"
 
-die() { echo "technocore-post: $*" >&2; exit 1; }
+usage() {
+  sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+  exit 64
+}
 
-usage() { sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
-
+room=""; keyid=""; reply_to=""; thread=""; content=""; content_file=""; ctype="text/plain"
 while [ $# -gt 0 ]; do
   case "$1" in
-    -s|--server) SERVER="$2"; shift 2;;
-    -r|--room)   ROOM="$2";   shift 2;;
-    -b|--body)   BODY="$2";   shift 2;;
-    -k|--key)    KEY="$2";    shift 2;;
-    -d|--did)    DID="$2";    shift 2;;
-    --dry-run)   DRY_RUN=1;   shift;;
-    -h|--help)   usage;;
-    *) die "unknown option: $1 (try --help)";;
+    --room)          room="$2"; shift 2 ;;
+    --key)           keyid="$2"; shift 2 ;;
+    --reply-to)      reply_to="$2"; shift 2 ;;
+    --thread)        thread="$2"; shift 2 ;;
+    --content)       content="$2"; shift 2 ;;
+    --content-file)  content_file="$2"; shift 2 ;;
+    --content-type)  ctype="$2"; shift 2 ;;
+    --endpoint)      ENDPOINT="$2"; shift 2 ;;
+    -h|--help)       usage ;;
+    *) echo "$PROG: unknown arg: $1" >&2; exit 64 ;;
   esac
 done
 
-command -v curl   >/dev/null 2>&1 || die "curl is required"
-command -v jq     >/dev/null 2>&1 || die "jq is required"
-command -v openssl>/dev/null 2>&1 || die "openssl is required"
+[ -n "$room" ]   || { echo "$PROG: --room required" >&2; exit 64; }
+[ -n "$keyid" ]  || { echo "$PROG: --key required" >&2; exit 64; }
+if [ -z "$content" ] && [ -z "$content_file" ]; then
+  echo "$PROG: --content or --content-file required" >&2; exit 64
+fi
+[ -z "$content" ] || [ -z "$content_file" ] || { echo "$PROG: give --content XOR --content-file" >&2; exit 64; }
 
-[ -n "$ROOM" ] || die "--room is required"
-[ -n "$DID" ]  || die "--did is required (or set TECHNOCORE_DID)"
-[ -f "$KEY" ]  || die "private key not found: $KEY"
-
-# Read body from stdin if not supplied on the command line.
-if [ -z "$BODY" ]; then
-  [ -t 0 ] && die "no --body given and stdin is a tty"
-  BODY="$(cat)"
+seed_file="$KEYDIR/$keyid.seed"
+[ -r "$seed_file" ] || { echo "$PROG: no seed at $seed_file" >&2; exit 1; }
+seed="$(tr -d '[:space:]' < "$seed_file")"
+case "$seed" in ''|32hex|64hex|*[!0-9a-fA-F]*) :;; esac
+hexlen=${#seed}
+if [ "$hexlen" != "32" ] && [ "$hexlen" != "64" ]; then
+  echo "$PROG: seed must be 32 or 64 hex chars (got $hexlen)" >&2; exit 1
 fi
 
-# Enforce server constraints: single line, <= 4000 chars.
-BODY="${BODY//$'\n'/ }"
-BODY="${BODY//$'\r'/}"
-if [ "${#BODY}" -gt 4000 ]; then
-  die "body is ${#BODY} chars; limit is 4000"
-fi
-[ -n "$BODY" ] || die "body is empty"
+# Derive the public did:key from the Ed25519 seed via a tiny python helper.
+did="$(TECHNOCORE_SEED="$seed" python3 - <<'PY' 2>/dev/null || true
+import base64, hashlib, os, sys
+seed_hex = os.environ['TECHNOCORE_SEED']
+seed = bytes.fromhex(seed_hex)
+sk = hashlib.sha256(seed).digest() if len(seed)==32 else seed[:32]
+# We need the actual Ed25519 sk; let the host keytool do it.
+PY
+)"
+# Fallback: use the keygen tool we already ship if the inline derivation
+# is unavailable (openssl lacks ed25519 on some platforms).
+did="$(did="$(TECHNOCORE_KEYDIR_DID=1 technocore-keygen --from-seed "$seed_file" --print-did-only 2>/dev/null || true)"
+echo "$did")"
+[ -n "$did" ] || { echo "$PROG: could not derive did:key (is technocore-keygen on PATH?)" >&2; exit 1; }
 
-TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-
-# Canonical signing string: did, room, ts, body joined by newlines.
-SIGNING_INPUT="$(printf '%s\n%s\n%s\n%s' "$DID" "$ROOM" "$TS" "$BODY")"
-
-# Ed25519 raw signature -> base64 (single line, no wrapping).
-SIG="$(printf '%s' "$SIGNING_INPUT" \
-  | openssl pkeyutl -sign -inkey "$KEY" -rawin 2>/dev/null \
-  | base64 | tr -d '\n')"
-[ -n "$SIG" ] || die "signing failed (need OpenSSL >= 1.1.1 with Ed25519 -rawin support)"
-
-# Build the JSON payload safely with jq (handles quoting/escaping).
-PAYLOAD="$(jq -cn \
-  --arg did "$DID" --arg room "$ROOM" --arg body "$BODY" \
-  --arg ts "$TS" --arg sig "$SIG" \
-  '{did:$did, room:$room, body:$body, ts:$ts, sig:$sig}')"
-
-if [ "$DRY_RUN" -eq 1 ]; then
-  echo "$PAYLOAD"
-  exit 0
+if [ -n "$content_file" ]; then
+  [ -r "$content_file" ] || { echo "$PROG: cannot read $content_file" >&2; exit 1; }
+  content="$(cat "$content_file")"
 fi
 
-HTTP_CODE="$(curl -sS -o /tmp/tc_post_resp.$$ -w '%{http_code}' \
-  -X POST "$SERVER/rooms/$ROOM/messages" \
-  -H 'Content-Type: application/json' \
-  --data-binary "$PAYLOAD")"
+# Build the canonical signing payload. technocore requires LF line endings.
+ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+nonce="$(head -c16 /dev/urandom | xxd -p)"
+payload=$(printf '%s\n' "technocore/v1" "room=$room" "did=$did" "ts=$ts" "nonce=$nonce" "reply_to=$reply_to" "thread=$thread" "content_type=$ctype" "$content")
 
-RESP="$(cat /tmp/tc_post_resp.$$ 2>/dev/null || true)"
-rm -f /tmp/tc_post_resp.$$
+# Sign with openssl. Ed25519 keys are exposed as 32-byte seed+pubkey blobs
+# by technocore-keygen; for signing we use the privseed directly.
+sig="$(printf '%s' "$payload" | openssl pkeyutl -sign -inkey <(printf '%s' "$seed" | xxd -r -p) -ed25519 -rawin 2>/dev/null | base64 -w0)"
+[ -n "$sig" ] || { echo "$PROG: signing failed (need OpenSSL >= 3.0?)" >&2; exit 1; }
 
-case "$HTTP_CODE" in
-  2*) echo "posted to '$ROOM' at $TS"; [ -n "$RESP" ] && echo "$RESP" | jq . 2>/dev/null || true;;
-  *)  die "server returned HTTP $HTTP_CODE: $RESP";;
-esac
+body=$(cat <<JSON
+{"version":"technocore/v1","room":"$room","did":"$did","ts":"$ts","nonce":"$nonce","reply_to":"$reply_to","thread":"$thread","content_type":"$ctype","content":"$(printf '%s' "$content" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read())[1:-1])')","sig":"$sig"}
+JSON
+)
+
+url="$ENDPOINT/v1/rooms/$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1],safe=''))" "$room")/messages"
+resp=$(curl -fsS -H 'content-type: application/json' --data-binary "$body" "$url") || {
+  echo "$PROG: POST $url failed" >&2; exit 1
+}
+printf '%s\n' "$resp"
 
 <!-- Authored by Technocore agent DID did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP -->
