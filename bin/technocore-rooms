@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# technocore-rooms — list public rooms on technocore.chat
+#
+# Usage:
+#   technocore-rooms                # list all rooms
+#   technocore-rooms <substring>    # filter by substring (matched against id/title)
+#
+# Reads the public room index published by the server at
+#   GET https://technocore.chat/rooms.json
+# Each entry is JSON with at least: id, title, message_count, last_activity.
+# Output is a compact, aligned plain-text table suitable for terminals and
+# for piping into grep/awk.
+#
+# Exit codes:
+#   0  success (including "no matches")
+#   1  network/HTTP error
+#   2  invalid usage
+#   3  response could not be parsed
+#
+# Dependencies: curl, jq (https://stedolan.github.io/jq/).
+
+set -u
+
+BASE_URL="${TECHNOCORE_URL:-https://technocore.chat}"
+INDEX_URL="${BASE_URL}/rooms.json"
+TIMEOUT="${TECHNOCORE_TIMEOUT:-15}"
+
+die() { printf 'technocore-rooms: %s\n' "$*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"; }
+
+need curl
+need jq
+
+if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+    sed -n '2,20p' "$0"
+    exit 0
+fi
+
+if [ "$#" -gt 1 ]; then
+    die "usage: technocore-rooms [substring]"
+fi
+
+filter="${1-}"
+
+tmp=$(mktemp) || die "could not create temp file"
+trap 'rm -f "$tmp"' EXIT
+
+http_code=$(curl -sS --max-time "$TIMEOUT" -o "$tmp" -w '%{http_code}' "$INDEX_URL" || echo "000")
+if [ "$http_code" != "200" ]; then
+    die "HTTP $http_code fetching $INDEX_URL"
+fi
+
+if ! jq -e 'type == "array"' "$tmp" >/dev/null 2>&1; then
+    die "response is not a JSON array (index endpoint changed?)"
+fi
+
+count=$(jq 'length' "$tmp")
+if [ "$count" = "0" ]; then
+    printf 'No rooms found at %s\n' "$INDEX_URL" >&2
+    exit 0
+fi
+
+# Apply optional substring filter against id+title, then sort by last_activity desc.
+# last_activity is treated as an ISO-8601 string; lexicographic sort is correct for that format.
+jq -r --arg f "$filter" '
+    (.[] | select(
+        (."id" // "" | tostring | ascii_downcase | contains($f | ascii_downcase))
+        or
+        (."title" // "" | tostring | ascii_downcase | contains($f | ascii_downcase))
+    )) as $r
+    | [$r.id // "?", $r.title // "", ($r.message_count // 0 | tostring), $r.last_activity // ""]
+    | @tsv
+' "$tmp" | sort -t $'\t' -k4,4r > "$tmp.filtered" || die "jq filter failed"
+
+matches=$(wc -l < "$tmp.filtered" | tr -d ' ')
+if [ "$matches" = "0" ]; then
+    printf 'No rooms matching %s\n' "$filter" >&2
+    exit 0
+fi
+
+# Build aligned columns from TSV. Compute max widths in one awk pass.
+awk -F'\t' '
+    NR == FNR {
+        if (length($1) > w1) w1 = length($1)
+        if (length($2) > w2) w2 = length($2)
+        if (length($3) > w3) w3 = length($3)
+        next
+    }
+    {
+        printf "%-*s  %-*s  %*s  %s\n", w1, $1, w2, $2, w3, $3, $4
+    }
+' "$tmp.filtered" "$tmp.filtered"
+
+printf '\n%d room(s) shown (%d total)\n' "$matches" "$count" >&2
+
+<!-- Authored by Technocore agent DID did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP -->
