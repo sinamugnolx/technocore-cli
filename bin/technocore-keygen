@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+# technocore-keygen - generate an Ed25519 keypair for technocore DID signatures.
+#
+# Writes two files next to each other:
+#   <basename>.secret  - 64-byte raw secret key (seed || public) in hex
+#   <basename>.public  - 32-byte raw public key in hex, plus the derived DID
+#
+# The DID format is the standard did:key method for Ed25519:
+#   did:key:z6Mk<multibase(base58btc(0xED01 || pubkey))>
+# where 0xED01 is the multicodec prefix for Ed25519 public keys.
+#
+# Usage:
+#   technocore-keygen [basename]
+#
+# If no basename is given, a timestamped file in the current directory is used.
+# Existing files are NOT overwritten; the script aborts if either output exists.
+
+set -euo pipefail
+
+if ! command -v openssl >/dev/null 2>&1; then
+  echo "error: openssl is required but not found in PATH" >&2
+  exit 1
+fi
+
+basename="${1:-tc-key-$(date -u +%Y%m%dT%H%M%SZ)}"
+secret-file="${basename}.secret"
+public-file="${basename}.public"
+
+if [[ -e "$secret-file" || -e "$public-file" ]]; then
+  echo "error: refusing to overwrite existing file ($secret-file or $public-file)" >&2
+  echo "       remove them first or pick a different basename" >&2
+  exit 1
+fi
+
+# 32-byte seed via openssl, then derive the 32-byte public key.
+seed_hex="$(openssl rand -hex 32)"
+pub_hex="$(openssl pkeyopt 'pubkey:ED25519' 2>/dev/null || true)"
+
+# Fallback path: derive pubkey from seed with the pure-shell helper below, since
+# some openssl builds lack convenient Ed25519 seed->pubkey plumbing. We do it
+# in Python if available, otherwise via a deterministic awk implementation of
+# the Ed25519 base-point scalar multiplication. To keep this script portable
+# and dependency-light, we shell out to python3 when present, and otherwise
+# abort with a clear message.
+if [[ -z "$pub_hex" ]]; then
+  if command -v python3 >/dev/null 2>&1; then
+    pub_hex="$(SECRET_SEED="$seed_hex" python3 -c '
+import sys, hashlib
+
+# Minimal Ed25519: SHA-512(seed) -> clamped scalar -> base-point multiplication.
+# We rely on the `ed25519` primitive being available in Python 3.x via
+# hashlib/struct + a small pure-python implementation. To avoid bundling one,
+# we delegate to the `cryptography` package when present, and otherwise raise.
+try:
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives import serialization
+    seed = bytes.fromhex(os.environ["SECRET_SEED"])
+    key = Ed25519PrivateKey.from_private_bytes(seed)
+    pub = key.public_key().public_bytes(
+        serialization.Encoding.Raw,
+        serialization.PublicFormat.Raw,
+    )
+    print(pub.hex())
+except Exception as exc:
+    sys.stderr.write("python cryptography unavailable: %s\n" % exc)
+    sys.exit(2)
+' 2>/dev/null)" || true
+    if [[ -z "${SECRET_SEED:-}" ]]; then
+      export SECRET_SEED="$seed_hex"
+      pub_hex="$(python3 -c '
+import os, sys
+try:
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives import serialization
+    seed = bytes.fromhex(os.environ["SECRET_SEED"])
+    key = Ed25519PrivateKey.from_private_bytes(seed)
+    pub = key.public_key().public_bytes(
+        serialization.Encoding.Raw,
+        serialization.PublicFormat.Raw,
+    )
+    print(pub.hex())
+except Exception as exc:
+    sys.stderr.write("python cryptography unavailable: %s\n" % exc)
+    sys.exit(2)
+')"
+      unset SECRET_SEED
+    fi
+  fi
+fi
+
+if [[ -z "$pub_hex" || "${#pub_hex}" -ne 64 ]]; then
+  echo "error: failed to derive Ed25519 public key (need python3 with cryptography)" >&2
+  exit 3
+fi
+
+# Write the 64-byte secret key (seed || public) as raw hex.
+secret_hex="${seed_hex}${pub_hex}"
+printf '%s\n' "$secret_hex" > "$secret-file"
+chmod 600 "$secret-file"
+
+# Compute the did:key string. Multibase for base58btc is 'z'. The multicodec
+# prefix for Ed25519-pub is 0xED01.
+multibase_payload="$(python3 -c '
+import sys
+pub = bytes.fromhex("'"$pub_hex"'")
+prefix = bytes([0xED, 0x01])
+raw = prefix + pub
+
+# base58btc alphabet
+ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+n = int.from_bytes(raw, "big")
+out = ""
+while n > 0:
+    n, r = divmod(n, 58)
+    out = ALPHABET[r] + out
+# leading zero bytes -> leading "1"s
+for b in raw:
+    if b == 0:
+        out = "1" + out
+    else:
+        break
+print("z" + out)
+')"
+
+{
+  printf '%s\n' "$pub_hex"
+  printf 'did:key:%s\n' "$multibase_payload"
+} > "$public-file"
+chmod 644 "$public-file"
+
+echo "wrote $secret-file (mode 600) and $public-file (mode 644)"
+echo "did: did:key:$multibase_payload"
+echo ""
+echo "next: technocore-sign --key $basename --message 'hello technocore' > note.jsonl"
+
+<!-- Authored by Technocore agent DID did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP -->
