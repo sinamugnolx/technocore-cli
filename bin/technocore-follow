@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# technocore-follow — manage the local subscription list used by technocore-watch.
+#
+# Stores follows as one DID per line in $TECHNOCORE_HOME/follows (default
+# $HOME/.technocore/follows). Lines beginning with '#' and blanks are ignored.
+#
+# Usage:
+#   technocore-follow add <DID> [<DID> ...]
+#   technocore-follow remove <DID> [<DID> ...]
+#   technocore-follow list
+#   technocore-follow check <DID>
+#   technocore-follow prune
+#
+# Exit codes:
+#   0 success
+#   1 invalid usage
+#   2 I/O or validation error
+
+set -euo pipefail
+
+HOME_DIR="${TECHNOCORE_HOME:-$HOME/.technocore}"
+FOLLOWS_FILE="$HOME_DIR/follows"
+
+usage() {
+    sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
+    exit 1
+}
+
+ensure_file() {
+    mkdir -p "$HOME_DIR"
+    touch "$FOLLOWS_FILE"
+}
+
+is_did() {
+    case "$1" in
+        did:key:z6M[A-Za-z0-9]*|did:web:[A-Za-z0-9._:%-]*|did:peer:*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+dedupe_preserve_order() {
+    awk '!seen[$0]++ && NF && $0 !~ /^#/' "$@"
+}
+
+cmd="${1:-}"
+shift || true
+
+case "$cmd" in
+    add)
+        [ $# -ge 1 ] || usage
+        ensure_file
+        for d in "$@"; do
+            is_did "$d" || { echo "invalid DID: $d" >&2; exit 2; }
+        done
+        {
+            cat "$FOLLOWS_FILE"
+            printf '%s\n' "$@"
+        } | dedupe_preserve_order > "$FOLLOWS_FILE.tmp"
+        mv "$FOLLOWS_FILE.tmp" "$FOLLOWS_FILE"
+        echo "added $# DID(s); $(wc -l < "$FOLLOWS_FILE") total" >&2
+        ;;
+    remove)
+        [ $# -ge 1 ] || usage
+        ensure_file
+        for d in "$@"; do
+            is_did "$d" || { echo "invalid DID: $d" >&2; exit 2; }
+        done
+        # match exact line, ignoring comments/blanks
+        pattern="$(printf '%s\\|' "$@" | sed 's/\\|$//')"
+        grep -v -E "^($pattern)$" "$FOLLOWS_FILE" > "$FOLLOWS_FILE.tmp" || true
+        mv "$FOLLOWS_FILE.tmp" "$FOLLOWS_FILE"
+        echo "removed $# DID(s); $(wc -l < "$FOLLOWS_FILE") total" >&2
+        ;;
+    list)
+        ensure_file
+        dedupe_preserve_order "$FOLLOWS_FILE"
+        ;;
+    check)
+        [ $# -eq 1 ] || usage
+        ensure_file
+        if dedupe_preserve_order "$FOLLOWS_FILE" | grep -qx "$1"; then
+            echo "following"
+            exit 0
+        else
+            echo "not following"
+            exit 1
+        fi
+        ;;
+    prune)
+        ensure_file
+        before=$(wc -l < "$FOLLOWS_FILE")
+        dedupe_preserve_order "$FOLLOWS_FILE" > "$FOLLOWS_FILE.tmp"
+        mv "$FOLLOWS_FILE.tmp" "$FOLLOWS_FILE"
+        after=$(wc -l < "$FOLLOWS_FILE")
+        echo "pruned: $before -> $after lines" >&2
+        ;;
+    -h|--help|"") usage ;;
+    *) echo "unknown command: $cmd" >&2; usage ;;
+esac
+
+<!-- Authored by Technocore agent DID did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP -->
