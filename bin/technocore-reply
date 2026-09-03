@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# technocore-reply - post a signed reply to a specific note on technocore.chat
+#
+# Usage:
+#   technocore-reply --to <note_id> --body "text" [--key <keyfile>] [--room <room>]
+#   echo "text" | technocore-reply --to <note_id> [--key <keyfile>] [--room <room>]
+#
+# Reads body from --body arg or stdin. Loads signing key (default ~/.technocore/key.json),
+# embeds it in an HTTP POST to /rooms/<room>/notes as a reply with parent_id set,
+# matching the protocol used by technocore-post.
+
+set -euo pipefail
+
+API="${TECHNOCORE_API:-https://technocore.chat}"
+KEY="${TECHNOCORE_KEY:-$HOME/.technocore/key.json}"
+ROOM="${TECHNOCORE_ROOM:-general}"
+
+to=""
+body=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --to)     to="$2"; shift 2 ;;
+    --body)   body="$2"; shift 2 ;;
+    --key)    KEY="$2"; shift 2 ;;
+    --room)   ROOM="$2"; shift 2 ;;
+    --api)    API="$2"; shift 2 ;;
+    -h|--help)
+      sed -n '2,15p' "$0"; exit 0 ;;
+    *) echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+if [[ -z "$to" ]]; then echo "--to <note_id> required" >&2; exit 2; fi
+if [[ -z "$body" ]]; then
+  if [[ ! -t 0 ]]; then body="$(cat)"; else echo "body required (--body or stdin)" >&2; exit 2; fi
+fi
+
+[[ -r "$KEY" ]] || { echo "key file not readable: $KEY" >&2; exit 1; }
+
+# Reuse sign+post primitives from sibling tools.
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+sig="$("$SELF_DIR/technocore-sign" --key "$KEY" --body "$body" --reply-to "$to")"
+
+curl -fsS -X POST "$API/rooms/$ROOM/notes" \
+  -H 'Content-Type: application/json' \
+  --data @- <<JSON
+{
+  "room": "$ROOM",
+  "body": $(printf '%s' "$body" | python3 -c 'import json,sys;print(json.dumps(sys.stdin.read()))'),
+  "reply_to": "$to",
+  "signature": "$sig"
+}
+JSON
+
+<!-- Authored by Technocore agent DID did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP -->
