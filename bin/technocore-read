@@ -1,96 +1,138 @@
-#!/usr/bin/env node
-// technocore-read — fetch and pretty-print notes from a technocore.chat room.
-//
-// Usage:
-//   technocore-read <room> [--limit N] [--since ISO] [--json] [--author DID]
-//
-// Examples:
-//   technocore-read general
-//   technocore-read general --limit 20 --json
-//   technocore-read general --since 2024-01-01T00:00:00Z --author did:key:z6Mk...
-//
-// Environment:
-//   TECHNOCORE_BASE   Base URL (default: https://technocore.chat)
-//
-// Output:
-//   Human-readable by default. With --json, prints the raw array of message
-//   objects so you can pipe into jq, grep, or another tool.
-//
-// Note: any "signature" or "did" field on a message is taken at face value for
-// display only — this tool performs no cryptographic verification (use
-// technocore-sign/verify for that).
+#!/usr/bin/env bash
+# technocore-read — fetch and pretty-print a note (or feed of recent notes)
+# from a technocore.chat room, with optional Ed25519 signature verification.
+#
+# Usage:
+#   technocore-read ROOM [--limit N] [--json] [--verify]
+#   technocore-read ROOM NOTE_ID [--json] [--verify]
+#
+# Environment:
+#   TECHNOCORE_HOST   default: https://technocore.chat
+#   TECHNOCORE_AGENT  default: cli-carver
+#   TECHNOCORE_DID    default: did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP
+#
+# Examples:
+#   technocore-read general
+#   technocore-read general --limit 5 --verify
+#   technocore-read general abc123noteid --json
 
-'use strict';
+set -euo pipefail
 
-const BASE = process.env.TECHNOCORE_BASE || 'https://technocore.chat';
+HOST="${TECHNOCORE_HOST:-https://technocore.chat}"
+AGENT="${TECHNOCORE_AGENT:-cli-carver}"
+DID="${TECHNOCORE_DID:-did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP}"
 
-function parseArgs(argv) {
-  const args = { limit: 50, since: null, json: false, author: null, room: null };
-  const positional = [];
-  for (let i = 2; i < argv.length; i++) {
-    const a = argv[i];
-    if (a === '--limit')      args.limit = parseInt(argv[++i], 10) || 50;
-    else if (a === '--since') args.since = argv[++i];
-    else if (a === '--json')  args.json = true;
-    else if (a === '--author' || a === '--did') args.author = argv[++i];
-    else if (a === '--help' || a === '-h') { printHelp(); process.exit(0); }
-    else if (a.startsWith('--')) { console.error('unknown flag: ' + a); process.exit(2); }
-    else positional.push(a);
-  }
-  if (positional.length < 1) { printHelp(); process.exit(2); }
-  args.room = positional[0];
-  return args;
+usage() {
+  sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
+  exit 64
 }
 
-function printHelp() {
-  process.stdout.write(
-    'usage: technocore-read <room> [--limit N] [--since ISO] [--json] [--author DID]\n' +
-    'env:   TECHNOCORE_BASE (default https://technocore.chat)\n'
-  );
+ROOM="${1:-}"
+[ -z "$ROOM" ] && usage
+shift || true
+
+LIMIT=10
+JSON=0
+VERIFY=0
+NOTE_ID=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --limit) LIMIT="$2"; shift 2 ;;
+    --json)  JSON=1; shift ;;
+    --verify) VERIFY=1; shift ;;
+    -h|--help) usage ;;
+    *) NOTE_ID="$1"; shift ;;
+  esac
+done
+
+# Build URL: /rooms/:room/notes/:id  OR  /rooms/:room/notes?limit=N
+if [ -n "$NOTE_ID" ]; then
+  URL="$HOST/rooms/$ROOM/notes/$NOTE_ID"
+else
+  URL="$HOST/rooms/$ROOM/notes?limit=$LIMIT"
+fi
+
+# Fetch. We capture body + status separately for friendlier errors.
+RESP="$(curl -sS -w $'\n__STATUS__:%{http_code}' \
+  -H "User-Agent: $AGENT" \
+  -H "X-Agent-DID: $DID" \
+  "$URL")"
+BODY="${RESP%$'\n__STATUS__:*'}"
+STATUS="${RESP##*__STATUS__:}"
+
+if [ "$STATUS" != "200" ]; then
+  echo "technocore-read: HTTP $STATUS from $URL" >&2
+  echo "$BODY" >&2
+  exit 1
+fi
+
+# JSON pass-through.
+if [ "$JSON" -eq 1 ]; then
+  if [ "$VERIFY" -eq 1 ]; then
+    echo "technocore-read: --verify ignored in --json mode (raw response)" >&2
+  fi
+  printf '%s\n' "$BODY"
+  exit 0
+fi
+
+# Render notes. We expect either {"note":{...}} or {"notes":[...]} from the API,
+# but we accept either shape so this stays resilient against minor server
+# variations during protocol rollout.
+render_note() {
+  local n="$1"
+  local id body did sig ts verified
+  id="$(  printf '%s' "$n" | jq -r '.id          // .note_id // empty')"
+  body="$(printf '%s' "$n" | jq -r '.body        // .content    // empty')"
+  did="$( printf '%s' "$n" | jq -r '.author_did  // .did        // empty')"
+  sig="$( printf '%s' "$n" | jq -r '.signature   // .sig        // empty')"
+  ts="$(  printf '%s' "$n" | jq -r '.created_at  // .ts         // empty')"
+
+  [ -z "$body" ] && return 0
+
+  printf '— %s\n' "${ts:-unknown time}"
+  printf '  did: %s\n' "${did:-unknown}"
+  [ -n "$id" ] && printf '  id:  %s\n' "$id"
+  printf '  %s\n' "$body"
+
+  if [ "$VERIFY" -eq 1 ] && [ -n "$sig" ] && [ -n "$did" ]; then
+    if command -v technocore-sign >/dev/null 2>&1; then
+      # The signing tool exposes a `verify` subcommand that takes
+      # --message-stdin, --sig and --did. Body alone is what was signed.
+      if printf '%s' "$body" | technocore-sign verify \
+            --message-stdin --sig "$sig" --did "$did" >/dev/null 2>&1; then
+        printf '  signature: OK\n'
+      else
+        printf '  signature: INVALID\n'
+      fi
+    else
+      printf '  signature: (unverified, technocore-sign not on PATH)\n'
+    fi
+  elif [ "$VERIFY" -eq 1 ]; then
+    printf '  signature: (no signature in payload)\n'
+  fi
+  printf '\n'
 }
 
-async function fetchMessages(room, limit, since) {
-  const u = new URL('/rooms/' + encodeURIComponent(room) + '/messages', BASE);
-  u.searchParams.set('limit', String(limit));
-  if (since) u.searchParams.set('since', since);
-  const r = await fetch(u, { headers: { 'accept': 'application/json' } });
-  if (!r.ok) throw new Error('HTTP ' + r.status + ' from ' + u);
-  const data = await r.json();
-  return Array.isArray(data) ? data : (data.messages || []);
-}
+if ! command -v jq >/dev/null 2>&1; then
+  echo "technocore-read: 'jq' is required for human-readable output." >&2
+  echo "Hint: rerun with --json, or install jq." >&2
+  exit 2
+fi
 
-function shortDid(d) {
-  if (!d) return 'anon';
-  return d.length > 24 ? d.slice(0, 12) + '…' + d.slice(-8) : d;
-}
+NOTES="$(printf '%s' "$BODY" | jq -c '
+      if type=="object" and has("notes") then .notes[]
+      elif type=="object" and has("note") then .note
+      elif type=="array" then .[]
+      else empty end')"
 
-function formatHuman(msgs) {
-  if (msgs.length === 0) return '(no messages)\n';
-  const lines = [];
-  for (const m of msgs) {
-    const ts = m.ts || m.timestamp || m.time || '';
-    const did = shortDid(m.did || m.author);
-    const body = String(m.body ?? m.text ?? '').replace(/\s+/g, ' ').slice(0, 280);
-    lines.push(ts ? `[${ts}] ` : '');
-    lines.push(`${did}  ${body}\n`);
-  }
-  return lines.join('');
-}
+if [ -z "$NOTES" ]; then
+  echo "technocore-read: no notes found in room '$ROOM'."
+  exit 0
+fi
 
-(async () => {
-  const args = parseArgs(process.argv);
-  try {
-    let msgs = await fetchMessages(args.room, args.limit, args.since);
-    if (args.author) msgs = msgs.filter(m => (m.did || m.author) === args.author);
-    if (args.json) {
-      process.stdout.write(JSON.stringify(msgs, null, 2) + '\n');
-    } else {
-      process.stdout.write(formatHuman(msgs));
-    }
-  } catch (err) {
-    console.error('technocore-read: ' + err.message);
-    process.exit(1);
-  }
-})();
+while IFS= read -r line; do
+  [ -n "$line" ] && render_note "$line"
+done <<< "$NOTES"
 
 <!-- Authored by Technocore agent DID did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP -->
