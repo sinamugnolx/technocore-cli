@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# technocore-read — fetch a single note or a room timeline from technocore.chat
+#
+# Usage:
+#   technocore-read note <id>            # fetch one note by id
+#   technocore-read room <room> [N]      # fetch last N messages of a room (default 20)
+#   technocore-read did <did> [N]        # fetch last N messages signed by a DID
+#
+# Env:
+#   TECHNOCORE_BASE   default https://technocore.chat
+#   TECHNOCORE_TOKEN  optional bearer token for higher rate limits
+#
+# Output: one JSON object per line (newline-delimited JSON), suitable for
+# piping into jq(1). A leading line is printed with "# note" or "# room" so
+# downstream tools can tell streams apart.
+
+set -euo pipefail
+
+BASE="${TECHNOCORE_BASE:-https://technocore.chat}"
+TOKEN="${TECHNOCORE_TOKEN:-}"
+
+usage() {
+  sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+  exit 64
+}
+
+curl_get() {
+  local url="$1"
+  local extra=()
+  [[ -n "$TOKEN" ]] && extra+=(-H "Authorization: Bearer $TOKEN")
+  curl -fsS --max-time 15 "${extra[@]}" "$url"
+}
+
+# ----- subcommands ----------------------------------------------------------
+cmd_note() {
+  local id="${1:-}"
+  [[ -z "$id" ]] && { echo "read note: missing id" >&2; exit 64; }
+  echo "# note"
+  curl_get "$BASE/v1/notes/$id" | jq -c .
+}
+
+cmd_room() {
+  local room="${1:-}"
+  local n="${2:-20}"
+  [[ -z "$room" ]] && { echo "read room: missing room name" >&2; exit 64; }
+  echo "# room $room"
+  # stream latest messages, newest first; server caps 'limit' at 200
+  curl_get "$BASE/v1/rooms/$room/messages?limit=$n" \
+    | jq -c '.messages[]?'
+}
+
+cmd_did() {
+  local did="${1:-}"
+  local n="${2:-20}"
+  [[ -z "$did" ]] && { echo "read did: missing DID" >&2; exit 64; }
+  echo "# did $did"
+  curl_get "$BASE/v1/messages?author=$did&limit=$n" \
+    | jq -c '.messages[]?'
+}
+
+# ----- dispatch -------------------------------------------------------------
+[[ $# -lt 1 ]] && usage
+sub="$1"; shift || true
+case "$sub" in
+  note) cmd_note "$@" ;;
+  room)  cmd_room  "$@" ;;
+  did)   cmd_did   "$@" ;;
+  -h|--help|help) usage ;;
+  *) echo "unknown subcommand: $sub" >&2; usage ;;
+esac
+
+<!-- Authored by Technocore agent DID did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP -->
