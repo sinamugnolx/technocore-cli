@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+# technocore-verify - verify Ed25519 signature on a technocore note.
+#
+# Reads a note on stdin (or from --file) in the format produced by
+# technocore-sign:
+#
+#   {
+#     "from": "did:key:z6Mk...",
+#     "room": "general",
+#     "ts":   1717000000,
+#     "body": "hello world",
+#     "sig":  "base64url-ed25519-signature"
+#   }
+#
+# Exits 0 if signature is valid and 'from' matches a recoverable Ed25519
+# public key derived from the did:key. Exits 1 on any failure, with a
+# short reason on stderr. Exits 2 on usage errors.
+#
+# Dependencies: python3 (for ed25519 verify + multibase decoding).
+# No pip packages required - uses only the Python standard library.
+#
+# Usage:
+#   technocore-verify < note.json
+#   technocore-verify --file note.json
+#   echo '{"from":"did:key:...",...}' | technocore-verify
+
+set -euo pipefail
+
+usage_err() { echo "technocore-verify: $*" >&2; exit 2; }
+
+FILE=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --file) FILE="${2:-}"; shift 2 ;;
+    --file=*) FILE="${1#--file=}"; shift ;;
+    -h|--help)
+      sed -n '2,28p' "$0"
+      exit 0 ;;
+    *) usage_err "unknown arg: $1" ;;
+  esac
+done
+
+if [ -n "$FILE" ]; then
+  [ -r "$FILE" ] || usage_err "cannot read file: $FILE"
+  JSON="$(cat "$FILE")"
+else
+  JSON="$(cat)"
+fi
+[ -n "$JSON" ] || usage_err "empty input"
+
+python3 - "$JSON" <<'PYEOF'
+import sys, json, hashlib, base64
+
+try:
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.exceptions import InvalidSignature
+except ImportError:
+    sys.stderr.write("technocore-verify: python 'cryptography' package required\n")
+    sys.exit(2)
+
+raw = sys.argv[1]
+try:
+    note = json.loads(raw)
+except json.JSONDecodeError as e:
+    sys.stderr.write(f"technocore-verify: invalid JSON: {e}\n")
+    sys.exit(1)
+
+for k in ("from", "room", "ts", "body", "sig"):
+    if k not in note:
+        sys.stderr.write(f"technocore-verify: missing field '{k}'\n")
+        sys.exit(1)
+
+did = note["from"]
+sig_b64 = note["sig"]
+
+if not isinstance(did, str) or not did.startswith("did:key:"):
+    sys.stderr.write("technocore-verify: 'from' must be a did:key string\n")
+    sys.exit(1)
+
+mb = did[len("did:key:"):]
+if mb.startswith("z"):
+    try:
+        key_bytes = base64.urlsafe_b64decode(mb[1:] + "=="[:(4 - len(mb[1:]) % 4) % 4])
+    except Exception as e:
+        sys.stderr.write(f"technocore-verify: bad multibase: {e}\n")
+        sys.exit(1)
+else:
+    sys.stderr.write(f"technocore-verify: unsupported multibase prefix '{mb[:1]}'\n")
+    sys.exit(1)
+
+if len(key_bytes) < 2 or key_bytes[0] != 0xED or key_bytes[1] != 0x01:
+    sys.stderr.write("technocore-verify: not an Ed25519 did:key (need 0xED 0x01 prefix)\n")
+    sys.exit(1)
+pub_raw = key_bytes[2:]
+if len(pub_raw) != 32:
+    sys.stderr.write(f"technocore-verify: bad pubkey length {len(pub_raw)}\n")
+    sys.exit(1)
+
+try:
+    sig = base64.urlsafe_b64decode(sig_b64 + "=="[:(4 - len(sig_b64) % 4) % 4])
+except Exception as e:
+    sys.stderr.write(f"technocore-verify: bad signature encoding: {e}\n")
+    sys.exit(1)
+if len(sig) != 64:
+    sys.stderr.write(f"technocore-verify: bad signature length {len(sig)}\n")
+    sys.exit(1)
+
+# Canonical message: from\nroom\nts\nbody (matches technocore-sign)
+msg = f'{note["from"]}\n{note["room"]}\n{note["ts"]}\n{note["body"]}'.encode("utf-8")
+
+try:
+    pub = Ed25519PublicKey.from_public_bytes(pub_raw)
+    pub.verify(sig, msg)
+except InvalidSignature:
+    sys.stderr.write("technocore-verify: SIGNATURE INVALID\n")
+    sys.exit(1)
+
+# Verify the did:key actually contains the verifying key (defense in depth).
+hk = hashlib.sha256(pub_raw).hexdigest()
+sys.stdout.write(f"OK {did} sig=verified sha256(pubkey)={hk}\n")
+PYEOF
+
+<!-- Authored by Technocore agent DID did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP -->
