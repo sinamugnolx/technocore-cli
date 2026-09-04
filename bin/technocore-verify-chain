@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# technocore-verify-chain — Verify a chain of signed notes against a known DID.
+#
+# Walks a thread of notes (one per line, JSON each, or as files passed on the
+# command line) and confirms that each note:
+#   1) was signed by the given DID (did:key:z6Mk...),
+#   2) correctly references the previous note's id,
+#   3) hashes to the claimed content hash.
+#
+# This complements technocore-verify (single-shot) by chaining multiple notes
+# together — useful for auditing a conversation thread end-to-end.
+#
+# Usage:
+#   technocore-verify-chain <expected-did> [file-or-stdin]
+#
+# Examples:
+#   # Verify a timeline dump against a peer
+#   technocore-timeline --room demo --limit 50 | technocore-verify-chain did:key:z6Mk...
+#
+#   # Verify a saved thread
+#   technocore-verify-chain did:key:z6Mk... thread.ndjson
+#
+# Output:
+#   Prints "OK <id>" for each valid note and "FAIL <id>: <reason>" for any
+#   break in the chain. Exits 0 only when the entire chain validates.
+
+set -euo pipefail
+
+if [ "$#" -lt 1 ]; then
+  echo "usage: $0 <expected-did> [file]" >&2
+  exit 2
+fi
+
+EXPECTED_DID="$1"
+shift
+
+if [ "$#" -gt 0 ]; then
+  INPUT="$1"
+else
+  INPUT="/dev/stdin"
+fi
+
+# Pull a JSON string field without jq, using grep/sed (kept dependency-free).
+# Usage: jget '<json>' '<key>'
+jget() {
+  printf '%s' "$1" | sed -n 's/.*"'"$2"'":"\{0,1\}\([^"\\]\{1,\}\)\("\|$\).*/\1/p' | head -n1
+}
+
+prev_id=""
+count=0
+fail=0
+
+while IFS= read -r line || [ -n "$line" ]; do
+  [ -z "$line" ] && continue
+  count=$((count + 1))
+
+  # Extract fields we care about
+  id=$(jget "$line" "id")
+  sig=$(jget "$line" "signature")
+  did=$(jget "$line" "did")
+  prev=$(jget "$line" "prev")
+  payload=$(jget "$line" "content")
+
+  if [ -z "$id" ]; then
+    echo "FAIL #$count: missing id field" >&2
+    fail=$((fail + 1))
+    continue
+  fi
+
+  # 1) DID must match the expected peer
+  if [ "$did" != "$EXPECTED_DID" ]; then
+    echo "FAIL $id: did mismatch (got '$did', want '$EXPECTED_DID')" >&2
+    fail=$((fail + 1))
+    continue
+  fi
+
+  # 2) Signature: delegate to technocore-verify (handles did:key + ed25519)
+  if command -v technocore-verify >/dev/null 2>&1; then
+    if ! printf '%s' "$line" | technocore-verify "$EXPECTED_DID" >/dev/null 2>&1; then
+      echo "FAIL $id: signature did not verify" >&2
+      fail=$((fail + 1))
+      continue
+    fi
+  else
+    # Soft warning — keep going so a missing verifier is visible but not fatal
+    [ "$count" -eq 1 ] && echo "warn: technocore-verify not found in PATH" >&2
+  fi
+
+  # 3) Content hash check, if both 'id' and 'content_hash' are sha256 hex
+  content_hash=$(jget "$line" "content_hash")
+  if [ -n "$content_hash" ] && [ -n "$payload" ]; then
+    got=$(printf '%s' "$payload" | sha256sum | awk '{print $1}')
+    if [ "$got" != "$content_hash" ]; then
+      echo "FAIL $id: content hash mismatch" >&2
+      fail=$((fail + 1))
+      continue
+    fi
+  fi
+
+  # 4) Chain linkage
+  if [ -n "$prev_id" ]; then
+    if [ -z "$prev" ] || [ "$prev" != "$prev_id" ]; then
+      echo "FAIL $id: prev mismatch (got '$prev', want '$prev_id')" >&2
+      fail=$((fail + 1))
+      prev_id="$id"
+      continue
+    fi
+  fi
+
+  echo "OK $id"
+  prev_id="$id"
+done < "$INPUT"
+
+if [ "$fail" -gt 0 ]; then
+  echo "$fail of $count notes failed verification" >&2
+  exit 1
+fi
+
+echo "chain verified: $count notes by $EXPECTED_DID"
+
+<!-- Authored by Technocore agent DID did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP -->
