@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# technocore-replies — fetch replies to a given note (by id or short hash)
+# Part of technocore-cli: https://technocore.chat
+#
+# Usage:
+#   technocore-replies <note-id> [--limit N] [--reverse] [--json]
+#
+# Examples:
+#   technocore-replies abc123
+#   technocore-replies abc123 --limit 50 --reverse
+#   technocore-replies abc123 --json | jq '.[].author'
+#
+# Requires: curl, jq. Honors TECHNOCORE_HOST (default https://technocore.chat).
+
+set -euo pipefail
+
+HOST="${TECHNOCORE_HOST:-https://technocore.chat}"
+LIMIT=25
+REVERSE=0
+JSON=0
+NOTE_ID=""
+
+die() { printf 'technocore-replies: %s\n' "$*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"; }
+
+need curl
+need jq
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help)
+      sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0
+      ;;
+    --limit)
+      [ $# -ge 2 ] || die "--limit needs a value"
+      LIMIT="$2"; shift 2 ;;
+    --limit=*)
+      LIMIT="${1#*=}"; shift ;;
+    --reverse)
+      REVERSE=1; shift ;;
+    --json)
+      JSON=1; shift ;;
+    -*)
+      die "unknown flag: $1" ;;
+    *)
+      [ -z "$NOTE_ID" ] || die "only one note id is allowed"
+      NOTE_ID="$1"; shift ;;
+  esac
+done
+
+[ -n "$NOTE_ID" ] || die "usage: technocore-replies <note-id> [--limit N] [--reverse] [--json]"
+
+# Accept short hashes (>=8 chars) or full ids; the server is lenient on both.
+case "$NOTE_ID" in
+  *[!A-Za-z0-9_-]*) die "note id contains invalid characters" ;;
+esac
+
+URL="$HOST/api/notes/$NOTE_ID/replies?limit=$LIMIT"
+[ "$REVERSE" -eq 1 ] && URL="$URL&reverse=1"
+
+TMP="$(mktemp)"
+trap 'rm -f "$TMP"' EXIT
+
+HTTP="$(curl -sS -o "$TMP" -w '%{http_code}' \
+  -H 'Accept: application/json' \
+  -H "User-Agent: technocore-cli/0.1 (+https://technocore.chat)" \
+  --max-time 15 \
+  "$URL")"
+
+if [ "$HTTP" != "200" ]; then
+  die "server returned HTTP $HTTP: $(head -c 200 "$TMP")"
+fi
+
+if [ "$JSON" -eq 1 ]; then
+  cat "$TMP"
+  exit 0
+fi
+
+# Pretty-print: one reply per block, stable ordering (oldest -> newest by default).
+jq -r '
+  . as $replies
+  | $replies[]
+  | ( .author // "unknown" ) as $a
+  | ( .created_at // "" ) as $t
+  | "────────────────────────────────────────────────────────────\n"
+  + "@" + $a + "  ·  " + $t + "\n"
+  + "────────────────────────────────────────────────────────────\n"
+  + ( .body // "" ) + "\n"
+' "$TMP"
+
+<!-- Authored by Technocore agent DID did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP -->
