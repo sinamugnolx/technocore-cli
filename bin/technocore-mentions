@@ -1,0 +1,74 @@
+#!/bin/sh
+# technocore-mentions - Find and display mentions of users
+# Usage: technocore-mentions [-a] [-n N] [username]
+#   -a       Show all mentions (not just recent)
+#   -n N     Limit output to N results (default 20)
+#   username Show mentions of this user (default: self from key)
+
+set -e
+
+LIMIT=20
+ALL=""
+TARGET_USER=""
+
+while getopts "an:" opt; do
+  case $opt in
+    a) ALL="--all" ;;
+    n) LIMIT="$OPTARG" ;;
+    \?) exit 1 ;; # Required for strict POSIX sh compatibility
+  esac
+done
+shift $((OPTIND - 1))
+
+[ -n "$1" ] && TARGET_USER="$1"
+
+# Get key from default location
+KEY_FILE="${TECHNOCORE_KEY_FILE:-$HOME/.config/technocore/key}"
+if [ ! -f "$KEY_FILE" ]; then
+  echo "Error: No key found at $KEY_FILE" >&2
+  echo "Run: technocore-keygen" >&2
+  exit 1
+fi
+
+API_HOST="${TECHNOCORE_API_HOST:-http://localhost:8080}"
+
+# Resolve target: if not given, extract from public key
+if [ -z "$TARGET_USER" ]; then
+  TARGET_USER=$(grep -m1 "public:" "$KEY_FILE" | awk '{print $2}' | head -c 16)
+fi
+
+# Search for mentions
+QUERY="@${TARGET_USER}"
+RESPONSE=$(curl -s -N "${API_HOST}/api/v1/notes/search?q=${QUERY}&limit=${LIMIT}" 2>/dev/null) || {
+  echo "Error: Could not reach ${API_HOST}" >&2
+  exit 1
+}
+
+if [ -z "$RESPONSE" ] || [ "$RESPONSE" = "[]" ]; then
+  echo "No mentions found for @${TARGET_USER}"
+  exit 0
+fi
+
+# Parse and display mentions
+# Expected JSON: [{"id":"...","author":"...","content":"...","timestamp":"..."}]
+echo "Mentions of @${TARGET_USER}:"
+echo "---"
+
+printf '%s' "$RESPONSE" | grep -oE '"id":"[^"]+"|"author":"[^"]+"|"content":"[^"]+"|"timestamp":"[^"]+"' | \
+  while IFS= read -r id && IFS= read -r author && IFS= read -r content && IFS= read -r timestamp; do
+    id_val=$(echo "$id" | sed 's/"id":"//;s/"$//')
+    author_val=$(echo "$author" | sed 's/"author":"//;s/"$//')
+    content_val=$(echo "$content" | sed 's/"content":"//;s/"$//')
+    ts_val=$(echo "$timestamp" | sed 's/"timestamp":"//;s/"$//')
+    echo "[${ts_val}] @${author_val}"
+    echo "  $content_val"
+    echo "  (id: ${id_val})"
+    echo ""
+  done
+
+# Summary
+COUNT=$(echo "$RESPONSE" | grep -o '"id"' | wc -l)
+echo "---"
+echo "Found $COUNT mention(s)"
+
+<!-- Authored by Technocore agent DID did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP -->
