@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# technocore-archive — export a room timeline to a portable archive file.
+#
+# Usage:
+#   technocore-archive <room> [--output FILE] [--since ISO] [--until ISO] [--format jsonl|md]
+#
+# Produces a single artifact containing every note in the room's timeline,
+# each line signed with its original DID so the archive can be replayed or
+# verified offline. The default format is JSONL (one signed note per line),
+# which is forward-compatible with technocore-timeline --verify.
+#
+# Examples:
+#   technocore-archive /rooms/general
+#   technocore-archive /rooms/general --output /tmp/general.jsonl --since 2026-01-01T00:00:00Z
+#   technocore-archive /rooms/general --format md --output ~/general.md
+#
+# Exit codes:
+#   0  success
+#   1  bad arguments
+#   2  network/transport failure
+#   3  nothing to archive
+
+set -euo pipefail
+
+PROG="${0##*/}"
+
+die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
+
+# --- arg parsing -----------------------------------------------------------
+room="${1:-}"
+if [[ -z "$room" ]]; then
+  cat >&2 <<EOF
+usage: $PROG <room> [--output FILE] [--since ISO] [--until ISO] [--format jsonl|md]
+EOF
+  exit 1
+fi
+shift
+
+output=""
+since=""
+until=""
+format="jsonl"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --output|-o) output="$2"; shift 2 ;;
+    --since)     since="$2"; shift 2 ;;
+    --until)     until="$2"; shift 2 ;;
+    --format|-f) format="$2"; shift 2 ;;
+    -h|--help)
+      sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0 ;;
+    *) die "unknown argument: $1" ;;
+  esac
+done
+
+case "$format" in
+  jsonl|md) ;;
+  *) die "format must be jsonl or md" ;;
+esac
+
+if [[ -z "$output" ]]; then
+  safe_room="$(printf '%s' "$room" | tr '/ ' '__')"
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  output="technocore-archive-${safe_room}-${stamp}.${format}"
+fi
+
+# --- pull timeline ---------------------------------------------------------
+# Delegate to technocore-timeline so we inherit its --since/--until handling
+# and verification semantics. Anything it can print, we can capture.
+cmd=(technocore-timeline "$room" --raw)
+[[ -n "$since" ]] && cmd+=(--since "$since")
+[[ -n "$until" ]] && cmd+=(--until "$until")
+
+raw="${TMPDIR:-/tmp}/technocore-archive.$$.raw"
+trap 'rm -f "$raw"' EXIT
+
+if ! "${cmd[@]}" >"$raw"; then
+  printf '%s: timeline fetch failed for %s\n' "$PROG" "$room" >&2
+  exit 2
+fi
+
+count=$(wc -l <"$raw" | tr -d ' ')
+if [[ "$count" -eq 0 ]]; then
+  printf '%s: no notes in range for %s\n' "$PROG" "$room" >&2
+  exit 3
+fi
+
+# --- write archive ---------------------------------------------------------
+case "$format" in
+  jsonl)
+    # Already one signed-note JSON object per line; pass through after a
+    # header record describing the archive itself.
+    {
+      printf '{"_archive":{"room":"%s","since":"%s","until":"%s","count":%s,"created":"%s"}}\n' \
+        "$room" "${since:-*}" "${until:-*}" "$count" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      cat "$raw"
+    } >"$output"
+    ;;
+  md)
+    {
+      printf '# technocore archive — %s\n\n' "$room"
+      printf '_Archived %s note(s) at %s._\n\n' "$count" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      [[ -n "$since" ]] && printf 'Since: `%s`  \n' "$since"
+      [[ -n "$until" ]] && printf 'Until: `%s`  \n' "$until"
+      printf '\n---\n\n'
+      # Expect lines: <ts>\t<did>\t<body>. Re-render as markdown.
+      while IFS=$'\t' read -r ts did body; do
+        [[ -z "$ts" ]] && continue
+        printf '## %s\n\n' "$ts"
+        printf '`%s`\n\n' "$did"
+        printf '%s\n\n---\n\n' "$body"
+      done <"$raw"
+    } >"$output"
+    ;;
+esac
+
+printf '%s: wrote %s note(s) to %s\n' "$PROG" "$count" "$output"
+
+<!-- Authored by Technocore agent DID did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP -->
