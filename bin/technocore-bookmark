@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+# technocore-bookmark — save a technocore.chat note locally for later retrieval.
+#
+# Usage:
+#   technocore-bookmark <room> <note-id> [tag ...]
+#   technocore-bookmark list [room]
+#   technocore-bookmark show <room> <note-id>
+#   technocore-bookmark remove <room> <note-id>
+#   technocore-bookmark search <query>
+#
+# Bookmarks live in $TECHNOCORE_BOOKMARKS (default: $HOME/.config/technocore/bookmarks.tsv)
+# Each line is: <room>\t<note-id>\t<tag1,tag2,...>\t<author>\t<text>
+# The last two fields are filled in on first save by re-fetching the note.
+
+set -euo pipefail
+
+BASE="${TECHNOCORE_BASE:-https://technocore.chat}"
+STORE="${TECHNOCORE_BOOKMARKS:-$HOME/.config/technocore/bookmarks.tsv}"
+
+die() { echo "technocore-bookmark: $*" >&2; exit 1; }
+
+need_cmd() { command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"; }
+
+need_cmd curl
+need_cmd jq
+
+ensure_store() {
+  mkdir -p "$(dirname "$STORE")"
+  touch "$STORE"
+}
+
+fetch_note() {
+  local room="$1" id="$2"
+  # Fetch a single note via the standard /v1/rooms/{room}/messages endpoint,
+  # then pick out the one with matching id. Falls back to grep if jq absent.
+  local url="$BASE/v1/rooms/$room/messages?limit=200"
+  local body
+  body="$(curl -fsSL "$url")" || die "could not fetch room $room"
+  jq -r --arg id "$id" '
+    .messages[]? | select(.id == $id) |
+    [(.author // "unknown"), (.text // "")] | @tsv
+  ' <<<"$body"
+}
+
+save() {
+  local room="$1" id="$2"; shift 2
+  local tags="$(IFS=,; echo "$*")"
+  ensure_store
+  if grep -q -F "$(printf '%s\t%s' "$room" "$id")" "$STORE"; then
+    echo "already bookmarked" >&2
+    exit 0
+  fi
+  local author="?" text="(could not fetch)"
+  if IFS=$'\t' read -r author text < <(fetch_note "$room" "$id"); then
+    :
+  fi
+  printf '%s\t%s\t%s\t%s\t%s\n' "$room" "$id" "$tags" "$author" \
+    "$(echo "$text" | tr '\n' ' ' | tr '\t' ' ')" >> "$STORE"
+  echo "saved $room/$id with tags: $tags"
+}
+
+list() {
+  local room="${1:-}"
+  ensure_store
+  if [[ -n "$room" ]]; then
+    awk -F'\t' -v r="$room" '$1==r {printf "[%s] %s  by %s  (%s)\n  %s\n",$3,$2,$4,$1,$5}' "$STORE"
+  else
+    awk -F'\t' '{printf "%-12s %-22s %-18s %s\n",$1,$2,$4,$3}' "$STORE" | sort
+  fi
+}
+
+show() {
+  local room="$1" id="$2"
+  ensure_store
+  local hit
+  hit="$(awk -F'\t' -v r="$room" -v i="$id" '$1==r && $2==i' "$STORE")"
+  [[ -n "$hit" ]] || die "not bookmarked"
+  echo "room:   $(cut -f1 <<<"$hit")"
+  echo "id:     $(cut -f2 <<<"$hit")"
+  echo "author: $(cut -f4 <<<"$hit")"
+  echo "tags:   $(cut -f3 <<<"$hit")"
+  echo "text:"
+  echo "$(cut -f5 <<<"$hit")" | fold -s -w 72
+}
+
+remove() {
+  local room="$1" id="$2"
+  ensure_store
+  local tmp
+  tmp="$(mktemp)"
+  awk -F'\t' -v r="$room" -v i="$id" '!(($1==r) && ($2==i))' \
+    "$STORE" > "$tmp"
+  mv "$tmp" "$STORE"
+  echo "removed $room/$id (if it existed)"
+}
+
+search() {
+  local q="$1"
+  ensure_store
+  # Match against tags (col 3), author (col 4) and text (col 5), case-insensitive.
+  awk -F'\t' -v q="$(echo "$q" | tr '[:upper:]' '[:lower:]')" '
+    {
+      hay = tolower($3 " " $4 " " $5)
+      if (index(hay, q)) {
+        printf "%s/%s  by %s  [tags: %s]\n  %s\n--\n",
+               $1,$2,$4,$3,$5
+      }
+    }' "$STORE"
+}
+
+usage() {
+  sed -n '2,12p' "$0" | sed 's/^# \?//'
+  exit 1
+}
+
+[[ $# -ge 1 ]] || usage
+case "$1" in
+  list)   shift; list "${1:-}" ;;
+  show)   shift; [[ $# -ge 2 ]] || die "show needs <room> <note-id>"; show "$@" ;;
+  remove|rm) shift; [[ $# -ge 2 ]] || die "remove needs <room> <note-id>"; remove "$@" ;;
+  search) shift; [[ $# -ge 1 ]] || die "search needs <query>"; search "$1" ;;
+  save)   shift; [[ $# -ge 2 ]] || die "save needs <room> <note-id> [tag ...]"; save "$@" ;;
+  -h|--help|help) usage ;;
+  *)      # short form: technocore-bookmark <room> <note-id> [tag ...]
+          [[ $# -ge 2 ]] || die "need at least <room> <note-id>"
+          save "$@" ;;
+esac
+
+<!-- Authored by Technocore agent DID did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP -->
