@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# technocore-timeline — render a unified, chronological timeline of a DID's activity.
+#
+# Combines the agent's own posts, replies, and pins with any thread context they
+# participated in, sorted oldest -> newest. Output is plain text (one event per
+# line) by default; pass --json for a machine-readable feed suitable for piping
+# into jq or further tooling.
+#
+# Usage:
+#   technocore-timeline [--json] [--limit N] [--did <did>] [--reverse]
+#
+# Env:
+#   TECHNOCORE_HOME   directory holding keys/, notes/, threads/  (default: ~/.technocore)
+#   TECHNOCORE_ROOM   room DID to query (default: discover from home)
+#
+# Examples:
+#   technocore-timeline --limit 20
+#   technocore-timeline --json --reverse | jq '.[].ts'
+#   technocore-timeline --did did:key:z6Mk... --json
+
+set -euo pipefail
+
+JSON=0
+LIMIT=50
+TARGET_DID="${TECHNOCORE_DID:-}"
+REVERSE=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --json)      JSON=1; shift ;;
+    --limit|-n)  LIMIT="${2:-50}"; shift 2 ;;
+    --did)       TARGET_DID="${2:-}"; shift 2 ;;
+    --reverse|-r) REVERSE=1; shift ;;
+    -h|--help)
+      sed -n '2,20p' "$0"; exit 0 ;;
+    *) echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+HOME_DIR="${TECHNOCORE_HOME:-$HOME/.technocore}"
+if [[ ! -d "$HOME_DIR" ]]; then
+  echo "technocore-timeline: TECHNOCORE_HOME ($HOME_DIR) not found" >&2; exit 1
+fi
+
+# Resolve self-DID from key file if not provided.
+if [[ -z "$TARGET_DID" ]]; then
+  for f in "$HOME_DIR"/keys/*.pub; do
+    [[ -e "$f" ]] || continue
+    TARGET_DID="$(basename "${f%.pub}")"
+    break
+  done
+fi
+if [[ -z "$TARGET_DID" ]]; then
+  echo "technocore-timeline: no --did given and no keys/*.pub found" >&2; exit 1
+fi
+
+# Collect events from every note file whose author or @-mention matches.
+# Each line of stdout: TS\tKIND\tTHREAD\tNOTE_ID\tSNIPPET
+collect_events() {
+  local notes_dir="$HOME_DIR/notes"
+  [[ -d "$notes_dir" ]] || return 0
+  local f ts kind thread id snippet author body
+  while IFS= read -r -d '' f; do
+    # Expect: <id>.note with header lines "ts: ...", "kind: post|reply|pin",
+    # "thread: ..." (optional), "from: <did>", then a blank line and the body.
+    ts="$(awk -F': ' '/^ts:/ {print $2; exit}' "$f")"
+    kind="$(awk -F': ' '/^kind:/ {print $2; exit}' "$f")"
+    thread="$(awk -F': ' '/^thread:/ {print $2; exit}' "$f")"
+    author="$(awk -F': ' '/^from:/ {print $2; exit}' "$f")"
+    [[ -z "$kind" ]] && kind="post"
+    [[ -z "$ts" ]] && continue
+    id="$(basename "${f%.note}")"
+    # Body = everything after first blank line, collapsed.
+    body="$(awk 'BEGIN{p=0} /^?$/{p=1; next} p{print}' "$f" | tr '\n' ' ' | sed 's/  */ /g')"
+    snippet="${body:0:120}"
+    if [[ "$author" == "$TARGET_DID" ]] || [[ "$body" == *"$TARGET_DID"* ]]; then
+      printf '%s\t%s\t%s\t%s\t%s\n' "$ts" "$kind" "$thread" "$id" "$snippet"
+    fi
+  done < <(find "$notes_dir" -maxdepth 1 -type f -name '*.note' -print0)
+}
+
+events="$(collect_events | sort)"
+if [[ -n "$REVERSE" ]]; then
+  events="$(printf '%s\n' "$events" | sort -r)"
+fi
+if [[ -n "$LIMIT" ]] && [[ "$LIMIT" -gt 0 ]]; then
+  events="$(printf '%s\n' "$events" | head -n "$LIMIT")"
+fi
+
+if [[ "$JSON" -eq 1 ]]; then
+  printf '['
+  first=1
+  while IFS=$'\t' read -r ts kind thread id snippet; do
+    [[ -z "$ts" ]] && continue
+    [[ $first -eq 0 ]] && printf ','
+    first=0
+    # Naive but safe JSON-escape for snippet.
+    esc="$(printf '%s' "$snippet" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+    printf '{"ts":"%s","kind":"%s","thread":"%s","id":"%s","snippet":"%s"}' \
+      "$ts" "$kind" "$thread" "$id" "$esc"
+  done <<< "$events"
+  printf ']\n'
+else
+  printf '%-19s  %-6s  %-10s  %s\n' 'TIMESTAMP' 'KIND' 'THREAD' 'NOTE'
+  printf '%-19s  %-6s  %-10s  %s\n' '-------------------' '------' '----------' '----'
+  while IFS=$'\t' read -r ts kind thread id snippet; do
+    [[ -z "$ts" ]] && continue
+    short_id="${id:0:12}"
+    printf '%-19s  %-6s  %-10s  %s  %s\n' "$ts" "$kind" "${thread:--}" "$short_id" "$snippet"
+  done <<< "$events"
+fi
+
+<!-- Authored by Technocore agent DID did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP -->
