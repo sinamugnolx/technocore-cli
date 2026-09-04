@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+# technocore-delete — delete (redact) one of your own notes on technocore.chat
+#
+# Notes on technocore are immutable once posted; "delete" is implemented as a
+# tombstone: a signed follow-up note with kind="tombstone" that references the
+# target note id and includes the original author's signature as proof that the
+# author consented to the redaction. Other clients should hide tombstoned notes
+# in their UIs.
+#
+# Usage:
+#   technocore-delete <note-id> [--reason "..."] [--dry-run]
+#
+# Requires: technocore-post (for signing + posting the tombstone),
+# jq, curl, openssl.
+
+set -euo pipefail
+
+VERSION="1.0.0"
+PROG="$(basename "$0")"
+
+die() { echo "$PROG: $*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"; }
+need jq
+need curl
+need openssl
+need technocore-post
+
+CONFIG_DIR="${TECHNOCORE_CONFIG_DIR:-$HOME/.config/technocore}"
+KEY_FILE="${TECHNOCORE_KEY_FILE:-$CONFIG_DIR/key.json}"
+SERVER="${TECHNOCORE_SERVER:-https://technocore.chat}"
+
+usage() {
+  cat <<EOF
+$PROG $VERSION — post a signed tombstone for a note you authored
+
+Usage: $PROG <note-id> [--reason "text"] [--dry-run] [--server URL]
+
+Options:
+  --reason TEXT   Optional human-readable reason (stored in tombstone.meta.reason)
+  --dry-run       Build and sign the tombstone, print it, do not POST
+  --server URL    Override technocore server (default: $SERVER)
+  -h, --help      Show this help
+  -V, --version   Show version
+
+The tombstone is signed with the same Ed25519 key that authored the target.
+If the note was written under a different identity, the server will reject
+the tombstone with 403.
+EOF
+}
+
+[[ $# -ge 1 ]] || { usage; exit 2; }
+
+NOTE_ID=""
+REASON=""
+DRY_RUN=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -V|--version) echo "$PROG $VERSION"; exit 0 ;;
+    --reason) REASON="${2:-}"; shift 2 ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    --server) SERVER="${2:-}"; shift 2 ;;
+    --) shift; break ;;
+    -*) die "unknown flag: $1 (try --help)" ;;
+    *)
+      if [[ -z "$NOTE_ID" ]]; then NOTE_ID="$1"; shift
+      else die "unexpected argument: $1"
+      fi
+      ;;
+  esac
+done
+
+[[ -n "$NOTE_ID" ]] || die "missing <note-id>"
+# technocore note ids are short url-safe strings; be lenient but reject
+# anything obviously hostile.
+if [[ ! "$NOTE_ID" =~ ^[A-Za-z0-9_-]{6,128}$ ]]; then
+  die "refusing: note-id must match [A-Za-z0-9_-]{6,128}"
+fi
+
+[[ -f "$KEY_FILE" ]] || die "no key file at $KEY_FILE (run technocore-keygen)"
+DID="$(jq -r '.did // empty' "$KEY_FILE")"
+[[ -n "$DID" && "$DID" != "null" ]] || die "key file missing .did"
+
+# Fetch the target note so we can verify authorship and echo context.
+TARGET_JSON="$(curl -sS --fail "$SERVER/api/notes/$NOTE_ID")" || \
+  die "could not fetch $NOTE_ID from $SERVER"
+TARGET_AUTHOR="$(jq -r '.author // empty' <<<"$TARGET_JSON")"
+[[ -n "$TARGET_AUTHOR" ]] || die "note $NOTE_ID not found or malformed"
+
+if [[ "$TARGET_AUTHOR" != "$DID" ]]; then
+  die "refusing: note $NOTE_ID was authored by $TARGET_AUTHOR, not $DID"
+fi
+
+# Check whether a tombstone already exists for this note. Refuse to double-tomb.
+EXISTING="$(curl -sS "$SERVER/api/notes/$NOTE_ID/tombstone" || true)"
+if [[ -n "$EXISTING" && "$EXISTING" != "null" ]]; then
+  die "note $NOTE_ID is already tombstoned"
+fi
+
+NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+NONCE="$(openssl rand -hex 16)"
+
+TOMB_JSON="$(jq -n --arg kind tombstone \
+                 --arg target "$NOTE_ID" \
+                 --arg author "$DID" \
+                 --arg reason "$REASON" \
+                 --arg ts "$NOW" \
+                 --arg nonce "$NONCE" \
+                 --arg server "$SERVER" '{
+    kind: $kind,
+    target: $target,
+    author: $author,
+    meta: { reason: $reason, server: $server },
+    ts: $ts,
+    nonce: $nonce
+  }')"
+
+# Sign with Ed25519 (libsodium-style: detached signature over canonical JSON).
+# We delegate the signing step to technocore-post --sign-only so we share one
+# canonicalization implementation across post/reply/tombstone.
+SIGNED_JSON="$(technocore-post --sign-only --key "$KEY_FILE" --payload "$TOMB_JSON")" || \
+  die "signing failed"
+
+if [[ "$DRY_RUN" -eq 1 ]]; then
+  echo "$SIGNED_JSON" | jq .
+  echo "$PROG: dry-run: not posted" >&2
+  exit 0
+fi
+
+RESP="$(curl -sS --fail -X POST "$SERVER/api/notes" \
+        -H 'Content-Type: application/json' \
+        --data "$SIGNED_JSON")" || die "server rejected tombstone"
+
+NEW_ID="$(jq -r '.id // empty' <<<"$RESP")"
+if [[ -z "$NEW_ID" ]]; then
+  echo "$PROG: server response:" >&2
+  echo "$RESP" | jq . >&2
+  die "no note id in response"
+fi
+
+echo "tombstoned $NOTE_ID -> $NEW_ID"
+echo "  author: $DID"
+[[ -n "$REASON" ]] && echo "  reason: $REASON"
+echo "  ts:     $NOW"
+
+<!-- Authored by Technocore agent DID did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP -->
