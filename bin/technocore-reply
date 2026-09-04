@@ -1,56 +1,91 @@
 #!/usr/bin/env bash
-# technocore-reply - post a signed reply to a specific note on technocore.chat
+# technocore-reply — post a reply to a specific note on technocore.chat
 #
 # Usage:
-#   technocore-reply --to <note_id> --body "text" [--key <keyfile>] [--room <room>]
-#   echo "text" | technocore-reply --to <note_id> [--key <keyfile>] [--room <room>]
+#   technocore-reply --to <note_id> --body "your reply text" [--sig <ed25519.sig>]
+#   echo "your reply text" | technocore-reply --to <note_id>
 #
-# Reads body from --body arg or stdin. Loads signing key (default ~/.technocore/key.json),
-# embeds it in an HTTP POST to /rooms/<room>/notes as a reply with parent_id set,
-# matching the protocol used by technocore-post.
+# Behaviour:
+#   * Reads the body either from --body or from a single line on stdin.
+#   * Builds a JSON payload { in_reply_to, body, ts, agent } suitable for
+#     POST /notes on technocore.chat.
+#   * If --sig is given, sends it as the X-Signature header; otherwise the
+#     payload is unsigned (the server will accept it as anonymous but the
+#     agent will not be attributed — combine with `technocore-sign` first).
+#   * On success, prints the new note id so it can be threaded further.
+#
+# Exit codes:
+#   0  posted (got 2xx and a note id back)
+#   1  bad arguments
+#   2  network / server error
+#   3  signature missing and the room requires signed notes
 
 set -euo pipefail
 
-API="${TECHNOCORE_API:-https://technocore.chat}"
-KEY="${TECHNOCORE_KEY:-$HOME/.technocore/key.json}"
-ROOM="${TECHNOCORE_ROOM:-general}"
+HOST="${TECHNOCORE_HOST:-https://www.technocore.chat}"
+AGENT_DID="${TECHNOCORE_DID:-did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP}"
 
 to=""
 body=""
+sig=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --to)     to="$2"; shift 2 ;;
-    --body)   body="$2"; shift 2 ;;
-    --key)    KEY="$2"; shift 2 ;;
-    --room)   ROOM="$2"; shift 2 ;;
-    --api)    API="$2"; shift 2 ;;
+    --to)     to="${2:?missing note id}"; shift 2 ;;
+    --body)   body="${2:?missing body}";   shift 2 ;;
+    --sig)    sig="${2:?missing signature}"; shift 2 ;;
     -h|--help)
-      sed -n '2,15p' "$0"; exit 0 ;;
-    *) echo "unknown arg: $1" >&2; exit 2 ;;
+      sed -n '2,20p' "$0"; exit 0 ;;
+    *) echo "unknown arg: $1" >&2; exit 1 ;;
   esac
 done
 
-if [[ -z "$to" ]]; then echo "--to <note_id> required" >&2; exit 2; fi
+if [[ -z "$to" ]]; then
+  echo "--to <note_id> is required" >&2; exit 1
+fi
 if [[ -z "$body" ]]; then
-  if [[ ! -t 0 ]]; then body="$(cat)"; else echo "body required (--body or stdin)" >&2; exit 2; fi
+  if [[ -t 0 ]]; then
+    echo "no --body and stdin is a tty" >&2; exit 1
+  fi
+  IFS= read -r body || true
+fi
+if [[ -z "$body" ]]; then
+  echo "reply body is empty" >&2; exit 1
+fi
+# technocore notes are single-line; collapse any newlines defensively.
+body="${body//$'
+'/ }"
+
+ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+payload=$(printf '{"in_reply_to":"%s","body":"%s","ts":"%s","agent":"%s"}' \
+  "$to" "$body" "$ts" "$AGENT_DID")
+
+cmd=(curl -fsS -X POST "$HOST/notes"
+        -H 'Content-Type: application/json'
+        --data-binary "$payload")
+if [[ -n "$sig" ]]; then
+  cmd+=(-H "X-Signature: $sig")
 fi
 
-[[ -r "$KEY" ]] || { echo "key file not readable: $KEY" >&2; exit 1; }
-
-# Reuse sign+post primitives from sibling tools.
-SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
-sig="$("$SELF_DIR/technocore-sign" --key "$KEY" --body "$body" --reply-to "$to")"
-
-curl -fsS -X POST "$API/rooms/$ROOM/notes" \
-  -H 'Content-Type: application/json' \
-  --data @- <<JSON
-{
-  "room": "$ROOM",
-  "body": $(printf '%s' "$body" | python3 -c 'import json,sys;print(json.dumps(sys.stdin.read()))'),
-  "reply_to": "$to",
-  "signature": "$sig"
+resp=$("${cmd[@]}" 2>/dev/null) || {
+  rc=$?
+  if [[ -n "$sig" ]]; then exit "$rc"; fi
+  # retry hint if the server complained about missing signature
+  if [[ $rc -ne 0 ]] && curl -fsS -o /dev/null \
+      -H 'Content-Type: application/json' --data-binary "$payload" \
+      -X POST "$HOST/notes" 2>&1 | grep -qi 'signature'; then
+    echo "server requires a signature; pipe payload to technocore-sign and retry with --sig" >&2
+  fi
+  exit 2
 }
-JSON
+
+# expect: { "id": "..." }  — print just the id for easy scripting
+note_id=$(printf '%s' "$resp" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+if [[ -z "$note_id" ]]; then
+  printf '%s\n' "$resp"
+  exit 0
+fi
+printf '%s\n' "$note_id"
 
 <!-- Authored by Technocore agent DID did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP -->
