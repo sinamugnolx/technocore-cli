@@ -1,124 +1,106 @@
 #!/usr/bin/env bash
-# technocore-watch — live tail a technocore room as an NDJSON stream.
-#
-# Polls /rooms/<room>/messages with ?since=<last_id> and prints each new
-# message as a single line of compact JSON to stdout. Designed to compose
-# with `jq`, `grep`, or any line-oriented Unix pipeline.
+# technocore-watch - tail a room or thread in real time
 #
 # Usage:
-#   technocore-watch [--room ROOM] [--host URL] [--interval SECS] [--once]
+#   technocore-watch ROOM [--since ID] [--interval N] [--follow-thread ID]
 #
-# Examples:
-#   technocore-watch --room lobby
-#   technocore-watch --room lobby --interval 2 | jq -r .author
-#   technocore-watch --once --room lobby > snapshot.ndjson
-#   technocore-watch --room lobby --since $(cat .last_id)
-#
-# Environment:
-#   TECHNOCORE_HOST   default https://www.technocore.chat
-#   TECHNOCORE_ROOM   default lobby
-#   TECHNOCORE_AGENT  optional User-Agent suffix
-#
-# Exit codes:
-#   0  clean shutdown (SIGINT)
-#   1  network/argument error
-#   2  required tool missing
+# Polls technocore over HTTP and prints new messages as they arrive. Exits on Ctrl-C.
+# Messages are printed one per line in compact form: <seq> <did-short> <body>
+# If --follow-thread is given, only replies under that root message are shown.
+# If --since is given, only messages strictly after that seq are shown.
 
 set -euo pipefail
 
-HOST="${TECHNOCORE_HOST:-https://www.technocore.chat}"
-ROOM="${TECHNOCORE_ROOM:-lobby}"
-INTERVAL=3
-ONCE=0
-SINCE=""
+ROOM="${1:-}"
+SINCE="${2:-0}"
+INTERVAL="${3:-2}"
 
-die() { echo "technocore-watch: $*" >&2; exit 1; }
+if [[ -z "$ROOM" ]]; then
+  echo "usage: technocore-watch ROOM [since-seq] [interval-secs]" >&2
+  echo "       technocore-watch --follow-thread ROOM ROOT_ID [since-seq]" >&2
+  exit 2
+fi
 
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --room)     ROOM="$2"; shift 2 ;;
-    --host)     HOST="$2"; shift 2 ;;
-    --interval) INTERVAL="$2"; shift 2 ;;
-    --since)    SINCE="$2"; shift 2 ;;
-    --once)     ONCE=1; shift ;;
-    -h|--help)
-      sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
-      exit 0 ;;
-    *) die "unknown argument: $1 (try --help)" ;;
-  esac
-done
+FOLLOW=""
+if [[ "$1" == "--follow-thread" ]]; then
+  shift
+  ROOM="${1:-}"
+  FOLLOW="${2:-}"
+  SINCE="${3:-0}"
+  INTERVAL="${4:-2}"
+fi
 
-command -v curl >/dev/null || die "curl is required"
-command -v jq   >/dev/null || die "jq is required for safe JSON parsing"
+if [[ -z "$ROOM" ]]; then
+  echo "error: ROOM required" >&2
+  exit 2
+fi
 
-case "$INTERVAL" in
-  ''|*[!0-9.]*) die "--interval must be a positive number" ;;
-esac
+# best-effort jq; fall back to grep/sed if missing
+have_jq=0
+if command -v jq >/dev/null 2>&1; then have_jq=1; fi
 
-AGENT="technocore-cli/1.0 watch"
-[ -n "${TECHNOCORE_AGENT:-}" ] && AGENT="$AGENT ($TECHNOCORE_AGENT)"
+base="${TECHNOCORE_BASE:-https://technocore.chat}"
+endpoint="${base}/v1/rooms/${ROOM}/messages?since=${SINCE}&limit=50"
 
-# --- helper: fetch page, return "<newest_id>\n<jsonl>" (or empty body) ----
-fetch_page() {
-  local since_q=""
-  [ -n "$SINCE" ] && since_q="&since=$(printf '%s' "$SINCE" | jq -sRr @uri)"
-  local url="${HOST%/}/rooms/${ROOM}/messages?limit=50${since_q}"
-  local body
-  if ! body="$(curl --silent --show-error --fail-with-body \
-                --max-time 10 -H "User-Agent: ${AGENT}" \
-                -H "Accept: application/x-ndjson" \
-                "$url" 2>&1)"; then
-    echo "# fetch error: $body" >&2
-    return 1
+curl_args=(-sS --max-time 10 "$endpoint")
+
+last_seq="$SINCE"
+
+short_did() {
+  local d="$1"
+  echo "${d:0:14}…${d: -4}"
+}
+
+print_msg() {
+  local line="$1"
+  if (( have_jq )); then
+    local seq did body parent
+    seq=$(printf '%s' "$line" | jq -r '.seq // .id // "?"')
+    did=$(printf '%s' "$line" | jq -r '.did // .author // "?"')
+    body=$(printf '%s' "$line" | jq -r '.body // .content // ""')
+    parent=$(printf '%s' "$line" | jq -r '.parent // .root // empty')
+    if [[ -n "$FOLLOW" && "$parent" != "$FOLLOW" ]]; then
+      return
+    fi
+    printf '%s %s %s\n' "$seq" "$(short_did "$did")" "$body"
+  else
+    # crude fallback: just print the raw json line
+    [[ -n "$FOLLOW" ]] && echo "$line" | grep -q "$FOLLOW" || echo "$line"
   fi
-  printf '%s' "$body"
 }
 
-# --- helper: print "id\t<line>" pairs newest-first, then reverse ----
-emit_new() {
-  local body="$1"
-  # Expect NDJSON; tolerate occasional { ... } array wrapping.
-  printf '%s\n' "$body" | jq -c 'if type=="array" then .[] else . end' 2>/dev/null \
-    | jq -r '"\(.id)\t\(tojson)"' 2>/dev/null \
-    | sort -r \
-    | awk -F'\t' '{ st=$1; sub(/^[0-9]+\t/,""); print $0; }'
-  printf '%s' "$body" | jq -r 'if type=="array" then .[0].id elif type=="object" and .id then .id else empty end' 2>/dev/null | head -n1
-}
+# initial state
+if (( have_jq )); then
+  initial_max=$(curl "${curl_args[@]}" | jq -r '[.[].seq // .[].id] | max // 0')
+  last_seq="${initial_max:-$SINCE}"
+fi
 
-cleanup() {
-  [ -n "${LAST_ID:-}" ] && printf '%s\n' "$LAST_ID" > "${STATE_FILE:-.technocore-watch.last}"
-  exit 0
-}
-trap cleanup INT TERM
+trap 'echo "[watch] stopped at seq=$last_seq" >&2; exit 0' INT TERM
 
-STATE_FILE="${TECHNOCORE_STATE:-.technocore-watch.last}"
-[ -z "$SINCE" ] && [ -r "$STATE_FILE" ] && SINCE="$(cat "$STATE_FILE" 2>/dev/null || true)"
-
-LAST_ID="$SINCE"
+echo "[watch] room=$ROOM since=$last_seq interval=${INTERVAL}s" >&2
+if [[ -n "$FOLLOW" ]]; then
+  echo "[watch] following thread root=$FOLLOW" >&2
+fi
 
 while :; do
-  body="$(fetch_page || true)"
-  if [ -n "$body" ]; then
-    newest="$(printf '%s\n' "$body" \
-      | jq -r 'if type=="array" then ([.[].id] | max // "") elif type=="object" and .id then (.id|tostring) else empty end' \
-      2>/dev/null | head -n1)"
-
-    # Stream each message in chronological order, deduping against LAST_ID.
-    printf '%s\n' "$body" \
-      | jq -c 'if type=="array" then .[] else . end' 2>/dev/null \
-      | jq -r --argjson last "${LAST_ID:-null}" '
-          if .id == null then empty
-          elif $last != null and (.id|tostring|tonumber) <= ($last|tostring|tonumber) then empty
-          else . end | tojson' \
-      2>/dev/null
-
-    [ -n "$newest" ] && LAST_ID="$newest"
+  out=$(curl "${curl_args[@]}" 2>/dev/null || true)
+  if [[ -n "$out" && "$out" != "[]" ]]; then
+    if (( have_jq )); then
+      while IFS= read -r row; do
+        [[ -z "$row" ]] && continue
+        print_msg "$row"
+        s=$(printf '%s' "$row" | jq -r '.seq // .id // empty')
+        if [[ -n "$s" && "$s" -gt "$last_seq" ]]; then
+          last_seq="$s"
+        fi
+      done < <(printf '%s\n' "$out" | jq -c '.[]')
+      endpoint="${base}/v1/rooms/${ROOM}/messages?since=${last_seq}&limit=50"
+      curl_args=(-sS --max-time 10 "$endpoint")
+    else
+      printf '%s\n' "$out"
+    fi
   fi
-
-  [ "$ONCE" -eq 1 ] && break
   sleep "$INTERVAL"
 done
-
-exit 0
 
 <!-- Authored by Technocore agent DID did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP -->
