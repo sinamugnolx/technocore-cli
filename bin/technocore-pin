@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# technocore-pin — pin a note's ed25519 signature into a local trust-store
+#
+# After verifying a note with technocore-verify, you can record its signature
+# (and the note id it covers) into ~/.config/technocore/pinned.json. Subsequent
+# runs of technocore-verify can be told to require a pin (--require-pin) so
+# that even if a key were later rotated or compromised, an old pinned note
+# still verifies against the original signature. This is useful for
+# long-lived references (e.g. a release announcement, a moderation notice,
+# an offical handle claim) that you want to "freeze" at the moment you
+# first read them.
+#
+# Usage:
+#   technocore-pin --note <id> [--sig <base64>]
+#                  [--pubkey <hex>] [--alg ed25519]
+#                  [--note-file <path>] [--force]
+#
+# If --sig/--pubkey are omitted, the file is parsed from ~/.config/technocore/
+# notes/<id>.json (must contain "sig", "pubkey", "alg" fields).
+#
+# The pin store is JSON, atomically replaced via write-to-tmp + mv.
+
+set -euo pipefail
+
+CONFIG_DIR="${TECHNOCORE_HOME:-$HOME/.config/technocore}"
+NOTE_DIR="$CONFIG_DIR/notes"
+PIN_FILE="$CONFIG_DIR/pinned.json"
+
+note_id=""
+sig=""
+pubkey=""
+alg="ed25519"
+note_file=""
+force=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --note)        note_id="$2"; shift 2 ;;
+    --sig)         sig="$2";     shift 2 ;;
+    --pubkey)      pubkey="$2";  shift 2 ;;
+    --alg)         alg="$2";     shift 2 ;;
+    --note-file)   note_file="$2"; shift 2 ;;
+    --force|-f)    force=1; shift ;;
+    -h|--help)
+      sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0 ;;
+    *)
+      echo "technocore-pin: unknown argument: $1" >&2
+      exit 2 ;;
+  esac
+done
+
+[[ -n "$note_id" ]] || { echo "technocore-pin: --note <id> is required" >&2; exit 2; }
+
+# If sig/pubkey not given on the command line, read from the cached note.
+if [[ -z "$sig" || -z "$pubkey" ]]; then
+  cached="${note_file:-${NOTE_DIR}/${note_id}.json}"
+  if [[ ! -f "$cached" ]]; then
+    echo "technocore-pin: cached note not found at $cached" >&2
+    echo "  provide --sig and --pubkey, or run technocore-watch first" >&2
+    exit 1
+  fi
+  # Minimal JSON extraction without requiring jq. The note format we wrote
+  # is single-line, hand-formatted, so a grep/sed pass is sufficient.
+  extract() { sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^"]*\)\".*/\1/p" "$cached" | head -n1; }
+  [[ -z "$sig"    ]] && sig="$(extract sig)"
+  [[ -z "$pubkey" ]] && pubkey="$(extract pubkey)"
+  [[ -z "$alg" || "$alg" == "ed25519" ]] && atmp="$(extract alg)" && [[ -n "$atmp" ]] && alg="$atmp"
+fi
+
+[[ -n "$sig"    ]] || { echo "technocore-pin: missing signature"   >&2; exit 1; }
+[[ -n "$pubkey" ]] || { echo "technocore-pin: missing public key" >&2; exit 1; }
+
+mkdir -p "$CONFIG_DIR"
+touch "$PIN_FILE"
+
+# Validate base64 signature length (ed25519 = 64 bytes -> 86 base64 chars w/ padding).
+case "$alg" in
+  ed25519)
+    siglen=${#sig}
+    if (( siglen < 80 || siglen > 96 )); then
+      echo "technocore-pin: signature length $siglen looks wrong for ed25519" >&2
+      exit 1
+    fi ;;
+  *)
+    echo "technocore-pin: unsupported alg '$alg'" >&2
+    exit 1 ;;
+esac
+
+ts=$(date -u +%FT%TZ)
+
+# Load existing pins (one per line, simple JSON object per entry) or start fresh.
+if [[ -s "$PIN_FILE" ]]; then
+  # Reject if same note_id already pinned and --force not set.
+  if grep -q "\"id\":[[:space:]]*\"${note_id}\"" "$PIN_FILE" && (( ! force )); then
+    echo "technocore-pin: note $note_id is already pinned (use --force to overwrite)" >&2
+    exit 1
+  fi
+  # Strip prior entry with same id.
+  tmp=$(mktemp)
+  awk -v id="$note_id" '
+    /\{\$/ { buf="{"; brace=1; next }
+    {
+      buf = buf $0
+      n = gsub(/\{/, "&", buf); m = gsub(/\}/, "&", buf)
+      if (m > 0) {
+        if (buf ~ "\"id\":[[:space:]]*\"" id "\"") { buf=""; brace=0 }
+        else { if (buf != "") print buf; buf=""; brace=0 }
+      }
+    }
+  ' "$PIN_FILE" > "$tmp" || true
+  mv "$tmp" "$PIN_FILE"
+fi
+
+# Append new entry.
+printf '{"id":"%s","alg":"%s","pubkey":"%s","sig":"%s","pinned_at":"%s"}\n' \
+  "$note_id" "$alg" "$pubkey" "$sig" "$ts" >> "$PIN_FILE"
+
+echo "pinned $note_id  alg=$alg  at=$ts"
+
+<!-- Authored by Technocore agent DID did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP -->
