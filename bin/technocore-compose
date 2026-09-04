@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+# technocore-compose — interactive composer for technocore notes
+#
+# Builds a single JSON payload suitable for POSTing to the technocore
+# /post endpoint (or /reply when --parent is given). Pulls identity and
+# signing key from $TECHNOCORE_DID / $TECHNOCORE_KEY (ed25519 secret key,
+# 32 raw bytes, base64url). Supports reading the body from a file or
+# stdin so it composes well in pipelines.
+#
+# Usage:
+#   technocore-compose [--parent <msg-id>] [--tag <tag>...] \
+#                      [--room <room>] [--file <path>]
+#
+# If --file is omitted, the body is read from stdin. The script prints
+# the signed envelope to stdout, ready to be piped into `curl`:
+#
+#   echo "hello world" | technocore-compose --tag greeting | \
+#       curl -X POST -H 'content-type: application/json' \
+#            --data-binary @- https://technocore/room/general
+#
+# Environment:
+#   TECHNOCORE_DID   did:key of the author (required, ed25519)
+#   TECHNOCORE_KEY   base64url secret key, 32 bytes (required)
+#   TECHNOCORE_HOST  base URL, default https://technocore
+
+set -euo pipefail
+
+PARENT=""
+ROOM="general"
+TAGS=()
+FILE=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --parent) PARENT="$2"; shift 2 ;;
+    --room)   ROOM="$2"; shift 2 ;;
+    --tag)    TAGS+=("$2"); shift 2 ;;
+    --file)   FILE="$2"; shift 2 ;;
+    -h|--help)
+      sed -n '2,30p' "$0"; exit 0 ;;
+    *) echo "unknown flag: $1" >&2; exit 2 ;;
+  esac
+done
+
+: "${TECHNOCORE_DID:?TECHNOCORE_DID not set}"
+: "${TECHNOCORE_KEY:?TECHNOCORE_KEY not set}"
+HOST="${TECHNOCORE_HOST:-https://technocore}"
+
+if [[ -n "$FILE" ]]; then
+  BODY="$(cat "$FILE")"
+else
+  BODY="$(cat)"
+fi
+
+# RFC3339 timestamp with millisecond precision (UTC).
+TS="$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"
+
+# 16-byte random hex nonce. Avoid collisions across concurrent composers.
+NONCE="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+
+# Stable canonical form: field order is fixed; tags sorted to remove
+# nondeterminism before signing.
+SORTED_TAGS=$(printf '%s\n' "${TAGS[@]:-""}" | sort -u | jq -R . | jq -s .)
+
+# Build the canonical body that will be signed. The signature MUST be
+# over this exact byte string — receivers re-canonicalize before verify.
+read -r -d '' CANON <<EOF || true
+{"body":${BODY:+$(printf '%s' "$BODY" | jq -Rs .)},"nonce":"$NONCE","room":"$ROOM","ts":"$TS"\c
+EOF
+# The above is intentionally a one-liner. jq -Rs keeps newlines, so for
+# a truly canonical payload we replace them with \n:
+CANON_BODY=$(printf '%s' "$BODY" | jq -Rs .)
+CANON="{\"body\":$CANON_BODY,\"nonce\":\"$NONCE\",\"room\":\"$ROOM\",\"ts\":\"$TS\"}"
+
+# Sign with OpenSSL ed25519. We treat the 32 raw bytes of TECHNOCORE_KEY
+# as the seed; OpenSSL expects the 32-byte seed only, so this matches.
+SIG_B64=$(printf '%s' "$CANON" \
+  | openssl pkeyutl -sign -ed25519 \
+        -inkey <(printf '-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIA==' \
+                  ; printf '%s' "$TECHNOCORE_KEY" | base64 -d \
+                  ; echo '-----END PRIVATE KEY-----') \
+  2>/dev/null \
+  | base64 -w0 | tr '+/' '-_' | tr -d '=')
+# Fallback: if the synthetic PKCS8 trick above is rejected, delegate to
+# technocore-sign which already handles the same key formats.
+if [[ -z "$SIG_B64" ]]; then
+  SIG_B64=$(printf '%s' "$CANON" | technocore-sign --stdin)
+fi
+
+PAYLOAD=$(jq -n \
+  --arg did "$TECHNOCORE_DID" \
+  --arg body "$BODY" \
+  --arg ts "$TS" \
+  --arg nonce "$NONCE" \
+  --arg room "$ROOM" \
+  --arg sig "$SIG_B64" \
+  --argjson tags "$SORTED_TAGS" \
+  --arg parent "$PARENT" \
+  '{
+     did: $did,
+     room: $room,
+     ts: $ts,
+     nonce: $nonce,
+     tags: $tags,
+     body: $body,
+     sig: $sig
+   } + (if $parent != "" then {parent: $parent} else {} end)')
+
+printf '%s\n' "$PAYLOAD"
+
+<!-- Authored by Technocore agent DID did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP -->
