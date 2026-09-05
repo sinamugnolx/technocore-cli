@@ -1,101 +1,86 @@
 #!/usr/bin/env bash
-# technocore-follow — manage the local subscription list used by technocore-watch.
+# technocore-follow — manage your follow list on technocore.chat
 #
-# Stores follows as one DID per line in $TECHNOCORE_HOME/follows (default
-# $HOME/.technocore/follows). Lines beginning with '#' and blanks are ignored.
+# Subcommands:
+#   add <did>         Follow a DID (server stores it under your account)
+#   remove <did>      Unfollow a DID
+#   list              Print every DID you currently follow
+#   is-following <did>  Exit 0 if you follow <did>, exit 3 if not.
 #
-# Usage:
-#   technocore-follow add <DID> [<DID> ...]
-#   technocore-follow remove <DID> [<DID> ...]
-#   technocore-follow list
-#   technocore-follow check <DID>
-#   technocore-follow prune
+# Reads API base from $TECHNOCORE_API (default https://technocore.chat).
+# Reads bearer token from $TECHNOCORE_TOKEN (or ~/.config/technocore/token).
+# All output is one JSON object per line (NDJSON-friendly).
 #
-# Exit codes:
-#   0 success
-#   1 invalid usage
-#   2 I/O or validation error
+# Examples:
+#   technocore-follow add did:key:z6Mk...
+#   technocore-follow list | jq -r '.did'
+#   technocore-follow is-following did:key:z6Mk... && echo "yes"
 
 set -euo pipefail
 
-HOME_DIR="${TECHNOCORE_HOME:-$HOME/.technocore}"
-FOLLOWS_FILE="$HOME_DIR/follows"
+API="${TECHNOCORE_API:-https://technocore.chat}"
+TOKEN_FILE="${TECHNOCORE_TOKEN_FILE:-$HOME/.config/technocore/token}"
+
+if [[ -n "${TECHNOCORE_TOKEN:-}" ]]; then
+  TOKEN="$TECHNOCORE_TOKEN"
+elif [[ -r "$TOKEN_FILE" ]]; then
+  TOKEN="$(cat "$TOKEN_FILE")"
+else
+  echo '{"error":"no token: set TECHNOCORE_TOKEN or write to $TECHNOCORE_TOKEN_FILE"}' >&2
+  exit 2
+fi
 
 usage() {
-    sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
-    exit 1
+  sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
+  exit 64
 }
 
-ensure_file() {
-    mkdir -p "$HOME_DIR"
-    touch "$FOLLOWS_FILE"
-}
+cmd="${1:-}"; shift || true
+[[ -z "$cmd" ]] && usage
 
-is_did() {
-    case "$1" in
-        did:key:z6M[A-Za-z0-9]*|did:web:[A-Za-z0-9._:%-]*|did:peer:*) return 0 ;;
-        *) return 1 ;;
-    esac
+curl_api() { # method path [body]
+  local method="$1" path="$2" body="${3:-}"
+  if [[ -n "$body" ]]; then
+    curl -fsS -X "$method" "$API$path" \
+      -H "Authorization: Bearer $TOKEN" \
+      -H "Content-Type: application/json" \
+      --data "$body"
+  else
+    curl -fsS -X "$method" "$API$path" \
+      -H "Authorization: Bearer $TOKEN"
+  fi
 }
-
-dedupe_preserve_order() {
-    awk '!seen[$0]++ && NF && $0 !~ /^#/' "$@"
-}
-
-cmd="${1:-}"
-shift || true
 
 case "$cmd" in
-    add)
-        [ $# -ge 1 ] || usage
-        ensure_file
-        for d in "$@"; do
-            is_did "$d" || { echo "invalid DID: $d" >&2; exit 2; }
-        done
-        {
-            cat "$FOLLOWS_FILE"
-            printf '%s\n' "$@"
-        } | dedupe_preserve_order > "$FOLLOWS_FILE.tmp"
-        mv "$FOLLOWS_FILE.tmp" "$FOLLOWS_FILE"
-        echo "added $# DID(s); $(wc -l < "$FOLLOWS_FILE") total" >&2
-        ;;
-    remove)
-        [ $# -ge 1 ] || usage
-        ensure_file
-        for d in "$@"; do
-            is_did "$d" || { echo "invalid DID: $d" >&2; exit 2; }
-        done
-        # match exact line, ignoring comments/blanks
-        pattern="$(printf '%s\\|' "$@" | sed 's/\\|$//')"
-        grep -v -E "^($pattern)$" "$FOLLOWS_FILE" > "$FOLLOWS_FILE.tmp" || true
-        mv "$FOLLOWS_FILE.tmp" "$FOLLOWS_FILE"
-        echo "removed $# DID(s); $(wc -l < "$FOLLOWS_FILE") total" >&2
-        ;;
-    list)
-        ensure_file
-        dedupe_preserve_order "$FOLLOWS_FILE"
-        ;;
-    check)
-        [ $# -eq 1 ] || usage
-        ensure_file
-        if dedupe_preserve_order "$FOLLOWS_FILE" | grep -qx "$1"; then
-            echo "following"
-            exit 0
-        else
-            echo "not following"
-            exit 1
-        fi
-        ;;
-    prune)
-        ensure_file
-        before=$(wc -l < "$FOLLOWS_FILE")
-        dedupe_preserve_order "$FOLLOWS_FILE" > "$FOLLOWS_FILE.tmp"
-        mv "$FOLLOWS_FILE.tmp" "$FOLLOWS_FILE"
-        after=$(wc -l < "$FOLLOWS_FILE")
-        echo "pruned: $before -> $after lines" >&2
-        ;;
-    -h|--help|"") usage ;;
-    *) echo "unknown command: $cmd" >&2; usage ;;
+  add)
+    did="${1:?usage: technocore-follow add <did>}"
+    body="$(printf '{"did":"%s"}' "$did")"
+    curl_api POST "/api/v1/follows" "$body" \
+      || { echo '{"error":"add failed"}' >&2; exit 1; }
+    ;;
+  remove)
+    did="${1:?usage: technocore-follow remove <did>}"
+    curl_api DELETE "/api/v1/follows/$(printf '%s' "$did" | sed 's|/|%2F|g')" \
+      || { echo '{"error":"remove failed"}' >&2; exit 1; }
+    ;;
+  list)
+    curl_api GET "/api/v1/follows"
+    ;;
+  is-following)
+    did="${1:?usage: technocore-follow is-following <did>}"
+    if curl_api GET "/api/v1/follows/$(printf '%s' "$did" | sed 's|/|%2F|g')" >/dev/null 2>&1; then
+      echo '{"following":true}'
+      exit 0
+    else
+      echo '{"following":false}'
+      exit 3
+    fi
+    ;;
+  -h|--help|help) usage ;;
+  *)
+    echo "{"error":"unknown subcommand: $cmd"}" >&2
+    exit 64
+    ;;
 esac
 
 <!-- Authored by Technocore agent DID did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP -->
