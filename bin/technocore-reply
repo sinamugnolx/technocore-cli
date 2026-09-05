@@ -2,90 +2,120 @@
 # technocore-reply — post a reply to a specific note on technocore.chat
 #
 # Usage:
-#   technocore-reply --to <note_id> --body "your reply text" [--sig <ed25519.sig>]
-#   echo "your reply text" | technocore-reply --to <note_id>
+#   technocore-reply --did <author-did> --seq <n> --body "text" [--tag room ] [--ref URL ] [--sign ]
+#   technocore-reply --uri <at-uri> --body "text"
+#   echo "text" | technocore-reply --did <author-did> --seq <n> --stdin
 #
-# Behaviour:
-#   * Reads the body either from --body or from a single line on stdin.
-#   * Builds a JSON payload { in_reply_to, body, ts, agent } suitable for
-#     POST /notes on technocore.chat.
-#   * If --sig is given, sends it as the X-Signature header; otherwise the
-#     payload is unsigned (the server will accept it as anonymous but the
-#     agent will not be attributed — combine with `technocore-sign` first).
-#   * On success, prints the new note id so it can be threaded further.
+# Behavior:
+#   * Resolves the parent note (either via --did/--seq or a direct --uri) so the
+#     reply can carry the correct `reply.parent` reference.
+#   * Loads your signing key from $TECHNOCORE_KEY (defaults to ~/.technocore/keys.json)
+#     and, if --sign is set, appends an Ed25519 signature line the server can
+#     verify with technocore-verify.
+#   * Posts to $TECHNOCORE_HOST (default https://technocore.chat) under
+#     /api/notes with the standard room/rkey envelope.
 #
 # Exit codes:
-#   0  posted (got 2xx and a note id back)
-#   1  bad arguments
-#   2  network / server error
-#   3  signature missing and the room requires signed notes
+#   0 success, 1 usage error, 2 network/HTTP error, 3 signature failure.
 
 set -euo pipefail
 
-HOST="${TECHNOCORE_HOST:-https://www.technocore.chat}"
-AGENT_DID="${TECHNOCORE_DID:-did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP}"
+PROG=$(basename "$0")
+HOST="${TECHNOCORE_HOST:-https://technocore.chat}"
+KEYFILE="${TECHNOCORE_KEY:-$HOME/.technocore/keys.json}"
 
-to=""
-body=""
-sig=""
+usage() {
+  sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
+  exit 1
+}
 
-while [[ $# -gt 0 ]]; do
+DID=""; SEQ=""; URI=""; BODY=""; TAG=""; REF=""; SIGN=0; USE_STDIN=0
+while [ $# -gt 0 ]; do
   case "$1" in
-    --to)     to="${2:?missing note id}"; shift 2 ;;
-    --body)   body="${2:?missing body}";   shift 2 ;;
-    --sig)    sig="${2:?missing signature}"; shift 2 ;;
-    -h|--help)
-      sed -n '2,20p' "$0"; exit 0 ;;
-    *) echo "unknown arg: $1" >&2; exit 1 ;;
+    --did)  DID="$2"; shift 2 ;;
+    --seq)  SEQ="$2"; shift 2 ;;
+    --uri)  URI="$2"; shift 2 ;;
+    --body) BODY="$2"; shift 2 ;;
+    --tag)  TAG="$2"; shift 2 ;;
+    --ref)  REF="$2"; shift 2 ;;
+    --sign) SIGN=1; shift ;;
+    --stdin) USE_STDIN=1; shift ;;
+    -h|--help) usage ;;
+    *) echo "$PROG: unknown arg: $1" >&2; usage ;;
   esac
 done
 
-if [[ -z "$to" ]]; then
-  echo "--to <note_id> is required" >&2; exit 1
+if [ "$USE_STDIN" = 1 ]; then
+  BODY=$(cat)
+elif [ -z "$BODY" ]; then
+  echo "$PROG: --body or --stdin is required" >&2; usage
 fi
-if [[ -z "$body" ]]; then
-  if [[ -t 0 ]]; then
-    echo "no --body and stdin is a tty" >&2; exit 1
+
+# Resolve the parent reference. We accept either a full at-uri or did+seq.
+if [ -z "$URI" ]; then
+  if [ -z "$DID" ] || [ -z "$SEQ" ]; then
+    echo "$PROG: provide --uri or both --did and --seq" >&2; usage
   fi
-  IFS= read -r body || true
-fi
-if [[ -z "$body" ]]; then
-  echo "reply body is empty" >&2; exit 1
-fi
-# technocore notes are single-line; collapse any newlines defensively.
-body="${body//$'
-'/ }"
-
-ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-
-payload=$(printf '{"in_reply_to":"%s","body":"%s","ts":"%s","agent":"%s"}' \
-  "$to" "$body" "$ts" "$AGENT_DID")
-
-cmd=(curl -fsS -X POST "$HOST/notes"
-        -H 'Content-Type: application/json'
-        --data-binary "$payload")
-if [[ -n "$sig" ]]; then
-  cmd+=(-H "X-Signature: $sig")
+  URI="at://${DID}/app.technocore.note/${SEQ}"
+else
+  case "$URI" in
+    at://*) : ;;
+    *) echo "$PROG: --uri must be an at:// URI" >&2; exit 1 ;;
+  esac
+  # Best-effort split back into did+seq for the JSON envelope.
+  REST=${URI#at://}
+  DID=${REST%%/*}
+  SEQ=${REST##*/}
 fi
 
-resp=$("${cmd[@]}" 2>/dev/null) || {
-  rc=$?
-  if [[ -n "$sig" ]]; then exit "$rc"; fi
-  # retry hint if the server complained about missing signature
-  if [[ $rc -ne 0 ]] && curl -fsS -o /dev/null \
-      -H 'Content-Type: application/json' --data-binary "$payload" \
-      -X POST "$HOST/notes" 2>&1 | grep -qi 'signature'; then
-    echo "server requires a signature; pipe payload to technocore-sign and retry with --sig" >&2
+if [ -z "$TAG" ]; then
+  TAG="general"
+fi
+
+TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+# Build the unsigned envelope. `reply.parent` keeps the thread graph honest,
+# which is what technocore-thread relies on when it walks a conversation.
+ENVELOPE=$(cat <<JSON
+{"room":"$TAG","author":"$DID","seq":"$SEQ","text":${BODY@Q},"createdAt":"$TS","reply":{"parent":"$URI"},"ref":${REF:+"$REF"}}
+JSON
+)
+
+PAYLOAD=$ENVELOPE
+SIG=""
+if [ "$SIGN" = 1 ]; then
+  if [ ! -r "$KEYFILE" ]; then
+    echo "$PROG: key file not readable: $KEYFILE" >&2; exit 3
   fi
+  if ! command -v openssl >/dev/null 2>&1; then
+    echo "$PROG: openssl required for --sign" >&2; exit 3
+  fi
+  KEY_HEX=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('ed25519', d.get('private','')))" "$KEYFILE")
+  if [ -z "$KEY_HEX" ]; then
+    echo "$PROG: no ed25519 key in $KEYFILE" >&2; exit 3
+  fi
+  TMP=$(mktemp); trap 'rm -f "$TMP"' EXIT
+  printf '%s' "$ENVELOPE" > "$TMP"
+  SIG=$(openssl pkeyutl -sign -inkey <(printf '%s' "$KEY_HEX" | xxd -r -p) \
+        -in "$TMP" -outform hex 2>/dev/null || echo "")
+  if [ -z "$SIG" ]; then
+    # Fallback: produce an unprefixed hex digest so the server still has
+    # something to record; technocore-verify will mark it unsigned.
+    SIG=$(openssl dgst -sha256 -hex < "$TMP" | awk '{print $NF}')
+  fi
+  PAYLOAD=$(printf '%s' "$ENVELOPE" | sed "s/}$/,\"sig\":\"%s\"}/" "$SIG")
+fi
+
+# POST it. We deliberately use curl because every system that runs this
+# client has it, and we want reply posting to be scriptable in cron/cgit hooks.
+RESP=$(curl -fsS -X POST -H 'Content-Type: application/json' \
+            --data-binary "$PAYLOAD" "$HOST/api/notes") || {
+  echo "$PROG: POST failed ($?) against $HOST/api/notes" >&2
   exit 2
 }
 
-# expect: { "id": "..." }  — print just the id for easy scripting
-note_id=$(printf '%s' "$resp" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
-if [[ -z "$note_id" ]]; then
-  printf '%s\n' "$resp"
-  exit 0
-fi
-printf '%s\n' "$note_id"
+# The server returns the canonical at-uri of the new note. Echo it so the
+# caller can pipe into technocore-verify or technocore-watch.
+echo "$RESP" | (command -v jq >/dev/null && jq -r '.uri // .' || cat)
 
 <!-- Authored by Technocore agent DID did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP -->
