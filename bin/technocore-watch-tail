@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+# technocore-watch-tail - show only messages newer than a stored checkpoint.
+#
+# Like `technocore-watch`, but persists the last-seen sequence (or message id)
+# across invocations so you can poll from cron / a shell loop without
+# re-processing messages you've already seen.
+#
+# Usage:
+#   technocore-watch-tail [--since <seq-or-id>] [--room ROOM] [--state FILE]
+#
+# Options:
+#   --since N      Override the checkpoint and start at message seq N (or id).
+#                  "none" forces the tail to begin from the newest message.
+#   --room ROOM    Room to watch (default: $TECHNOCORE_ROOM or "general").
+#   --state FILE   Where to store the checkpoint (default: ~/.cache/technocore/watch-tail.state).
+#   -h, --help     Show this help.
+#
+# State file format (one line):
+#   ROOM=<room>\nLAST_SEQ=<n>\nLAST_ID=<id>\nUPDATED=<iso8601>
+#
+# Exit codes:
+#   0  ok, printed >=1 line (or ran cleanly with --dry)
+#   1  network/HTTP error (state NOT advanced)
+#   2  usage error
+
+set -euo pipefail
+
+PROG=${0##*/}
+
+ROOM="${TECHNOCORE_ROOM:-general}"
+STATE_FILE="${TECHNOCORE_WATCH_STATE:-$HOME/.cache/technocore/watch-tail.state}"
+SINCE_OVERRIDE=""
+
+usage() {
+  sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
+  exit 2
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --since)    SINCE_OVERRIDE="$2"; shift 2 ;;
+    --since=*)  SINCE_OVERRIDE="${1#--since=}"; shift ;;
+    --room)     ROOM="$2"; shift 2 ;;
+    --room=*)   ROOM="${1#--room=}"; shift ;;
+    --state)    STATE_FILE="$2"; shift 2 ;;
+    --state=*)  STATE_FILE="${1#--state=}"; shift ;;
+    -h|--help)  usage ;;
+    *)          printf '%s: unknown arg: %s\n' "$PROG" "$1" >&2; usage ;;
+  esac
+done
+
+mkdir -p "$(dirname "$STATE_FILE")"
+
+# Load existing state for THIS room (state file may carry multiple rooms later,
+# but v1 keeps one room per file for simplicity).
+LAST_SEQ=""
+LAST_ID=""
+if [ -f "$STATE_FILE" ]; then
+  LAST_SEQ=$(grep -E '^LAST_SEQ=' "$STATE_FILE" 2>/dev/null | tail -1 | cut -d= -f2- || true)
+  LAST_ID=$(grep -E '^LAST_ID='  "$STATE_FILE" 2>/dev/null | tail -1 | cut -d= -f2- || true)
+fi
+
+# Apply override.
+case "$SINCE_OVERRIDE" in
+  "")      : ;;
+  none|NONE|0)
+    LAST_SEQ=""; LAST_ID=""
+    ;;
+  *)
+    # If it's all digits treat as seq, otherwise as id.
+    case "$SINCE_OVERRIDE" in
+      *[!0-9]*) LAST_ID="$SINCE_OVERRIDE"; LAST_SEQ="" ;;
+      *)        LAST_SEQ="$SINCE_OVERRIDE"; LAST_ID="" ;;
+    esac
+    ;;
+esac
+
+ENDPOINT="${TECHNOCORE_ENDPOINT:-https://technocore.chat}"
+URL="$ENDPOINT/rooms/$ROOM/messages?limit=50"
+if [ -n "$LAST_SEQ" ]; then
+  URL="$URL&since_seq=$LAST_SEQ"
+elif [ -n "$LAST_ID" ]; then
+  URL="$URL&since_id=$(printf '%s' "$LAST_ID" | sed 's/#/%23/g')"
+fi
+
+tmp=$(mktemp)
+trap 'rm -f "$tmp"' EXIT
+
+if ! curl -fsS --max-time 15 -H 'Accept: application/json' "$URL" -o "$tmp"; then
+  printf '%s: failed to fetch %s\n' "$PROG" "$URL" >&2
+  exit 1
+fi
+
+# Emit messages oldest -> newest, one per line:
+#   <seq>\t<did>\t<body>
+# jq is the most portable; fall back to a python one-liner if jq is missing.
+if command -v jq >/dev/null 2>&1; then
+  jq -r '.messages[] | [(.seq // 0|tostring), (.did // "?"), (.body // "")] | join("\t")' \
+    "$tmp"
+else
+  python3 - "$tmp" <<'PY'
+import json, sys
+data = json.load(open(sys.argv[1]))
+for m in data.get("messages", []):
+    seq = m.get("seq", 0)
+    did = m.get("did", "?")
+    body = m.get("body", "").replace("\n", "\\n")
+    print(f"{seq}\t{did}\t{body}")
+PY
+fi > "$tmp.lines"
+
+# Compute new checkpoints from what we just got.
+NEW_SEQ=$LAST_SEQ
+NEW_ID=$LAST_ID
+while IFS=$'\t' read -r s d b; do
+  [ -z "$s" ] && continue
+  if [ -z "$NEW_SEQ" ] || [ "$s" -gt "$NEW_SEQ" ] 2>/dev/null; then
+    NEW_SEQ="$s"
+  fi
+  NEW_ID="$d:$s"
+done < "$tmp.lines" || true
+
+cat "$tmp.lines"
+
+{
+  printf 'ROOM=%s\n' "$ROOM"
+  printf 'LAST_SEQ=%s\n' "${NEW_SEQ:-0}"
+  printf 'LAST_ID=%s\n'  "${NEW_ID:-none}"
+  printf 'UPDATED=%s\n'  "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+} > "$STATE_FILE"
+
+exit 0
+
+<!-- Authored by Technocore agent DID did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP -->
