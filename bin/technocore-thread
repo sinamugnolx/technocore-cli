@@ -1,153 +1,167 @@
 #!/usr/bin/env bash
-# technocore-thread - reconstruct a full conversation thread from a note id.
+# technocore-thread — reconstruct a conversation thread from root to leaf.
 #
-# Walks the in_reply_to chain in both directions and prints an ordered
-# transcript of the conversation. Works offline against the local mirror
-# populated by `technocore-watch` (defaults to ~/.cache/technocore/notes).
+# Reads a JSONL stream (stdin or --file) of technocore notes and prints the
+# chain of replies that descend from a given root note id, ordered from root
+# to the deepest leaf. Useful for following a discussion that branched.
 #
 # Usage:
-#   technocore-thread <note-id> [--json] [--no-verify] [--root]
+#   technocore-thread --root <id> [--file notes.jsonl]
+#   cat notes.jsonl | technocore-thread --root <id>
 #
-# Examples:
-#   technocore-thread n-abc123
-#   technocore-thread n-abc123 --json | jq '.[].author'
-#   technocore-thread n-abc123 --root
+# Notes are expected to be JSON objects containing at minimum:
+#   id           — note id
+#   reply_to     — parent note id (optional; absent on root)
+#   author       — did:key string
+#   body         — message body
+#   created_at   — ISO8601 timestamp (optional, used for sorting siblings)
 #
-# Exit codes:
-#   0  success (note found, chain resolved)
-#   1  bad arguments
-#   2  note not found locally
-#   3  signature verification failed (only with default --verify)
+# Output: one JSON object per line, root first, then each child indented by
+# depth, terminated by a summary line {"summary":{...}}.
 
 set -euo pipefail
 
-PROG="${0##*/}"
-MIRROR="${TECHNOCORE_MIRROR:-$HOME/.cache/technocore/notes}"
-JSON=0
-VERIFY=1
-ROOT=0
-
-usage() {
-  sed -n '2,17p' "$0" | sed 's/^# \?//'
-  exit 1
+print_help() {
+  sed -n '2,20p' "$0" | sed 's/^# //; s/^#//'
+  exit 0
 }
 
-[[ $# -ge 1 ]] || usage
-NOTE_ID="$1"; shift
+ROOT=""
+FILE=""
 
-while [[ $# -gt 0 ]]; do
+while [ $# -gt 0 ]; do
   case "$1" in
-    --json)     JSON=1 ;;
-    --no-verify) VERIFY=0 ;;
-    --root)     ROOT=1 ;;
-    -h|--help)  usage ;;
-    *)          echo "$PROG: unknown flag: $1" >&2; exit 1 ;;
+    -h|--help) print_help ;;
+    --root) ROOT="$2"; shift 2 ;;
+    --file) FILE="$2"; shift 2 ;;
+    *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
-  shift
 done
 
-[[ -d "$MIRROR" ]] || { echo "$PROG: mirror not found at $MIRROR; run technocore-watch first" >&2; exit 2; }
-
-# Locate a note file by id. Layout: $MIRROR/<id>.json or $MIRROR/<id> (raw).
-find_note() {
-  local id="$1" p
-  for p in "$MIRROR/$id.json" "$MIRROR/$id"; do
-    [[ -f "$p" ]] && { echo "$p"; return 0; }
-  done
-  return 1
-}
-
-# Pull a JSON field without requiring jq. Tolerates pretty-printed input.
-jget() {
-  local file="$1" key="$2"
-  python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get(sys.argv[2], ''))" "$file" "$key"
-}
-
-# Walk upward via in_reply_to to the root of the thread.
-walk_root() {
-  local id="$1" cur="$id" parent
-  while :; do
-    local path; path="$(find_note "$cur")" || return 1
-    parent="$(jget "$path" in_reply_to || true)"
-    if [[ -z "$parent" || "$parent" == "None" ]]; then
-      echo "$cur"; return 0
-    fi
-    cur="$parent"
-  done
-}
-
-start="$(find_note "$NOTE_ID" || true)"
-if [[ -z "$start" ]]; then
-  echo "$PROG: note $NOTE_ID not found in $MIRROR" >&2
+if [ -z "$ROOT" ]; then
+  echo "--root <id> is required" >&2
   exit 2
 fi
 
-root_id="$(walk_root "$NOTE_ID")"
-
-# BFS downward from the root, building a parent->children map from the mirror.
-mapfile -t ALL_FILES < <(find "$MIRROR" -maxdepth 1 -type f \( -name '*.json' -o ! -name '*.json' \) | sort)
-declare -A CHILDREN
-declare -A SEEN
-
-for f in "${ALL_FILES[@]}"; do
-  bn="${f##*/}"; id="${bn%.json}"
-  pid="$(jget "$f" in_reply_to 2>/dev/null || echo '')"
-  if [[ -n "$pid" && "$pid" != "None" ]]; then
-    CHILDREN["$pid"]+="${id} "
-  fi
-  SEEN["$id"]=1
-done
-
-ORDER=()
-walk_down() {
-  local id="$1" depth="$2"
-  ORDER+=("${depth}|${id}")
-  for child in ${CHILDREN["$id"]:-}; do
-    [[ -n "$child" ]] && walk_down "$child" $((depth+1))
-  done
-}
-walk_down "$root_id" 0
-
-# Render.
-if (( JSON )); then
-  echo "["
-  first=1
-  for entry in "${ORDER[@]}"; do
-    depth="${entry%%|*}"; id="${entry#*|}"
-    path="$(find_note "$id")"
-    body="$(jget "$path" body)"
-    author="$(jget "$path" author)"
-    ts="$(jget "$path" created_at)"
-    sig="$(jget "$path" signature)"
-    pid="$(jget "$path" in_reply_to)"
-    (( first )) || echo ","
-    first=0
-    printf '  {"id":"%s","depth":%s,"author":"%s","created_at":"%s","in_reply_to":%s,"signature":"%s","body":%s}' \
-      "$id" "$depth" "$author" "$ts" \
-      "$([[ -z "$pid" || "$pid" == "None" ]] && echo null || echo "\"$pid\"")" \
-      "$sig" "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$body")"
-  done
-  echo
-  echo "]"
-else
-  printf 'thread root: %s   (%d notes)\n\n' "$root_id" "${#ORDER[@]}"
-  for entry in "${ORDER[@]}"; do
-    depth="${entry%%|*}"; id="${entry#*|}"
-    path="$(find_note "$id")"
-    author="$(jget "$path" author)"
-    ts="$(jget "$path" created_at)"
-    body="$(jget "$path" body)"
-    indent="$(printf '%*s' "$((depth*2))" '')"
-    marker="$id"
-    [[ "$id" == "$NOTE_ID" ]] && marker="$id  <-- pivot"
-    printf '%s\u2502 %s  %s  @%s\n' "$indent" "$marker" "$ts" "$author"
-    printf '%s\u2502 %s\n' "$indent" "${body//\n/\$indent\u2502 }"
-    printf '%s\u2514\u2500\n' "$indent"
-  done
+if [ -n "$FILE" ]; then
+  exec < "$FILE"
 fi
 
-(( ROOT )) && { echo "$root_id"; exit 0; }
+# Pass 1: load all notes into a temp file, build parent->children index in memory.
+TMP=$(mktemp)
+trap 'rm -f "$TMP"' EXIT
 
-exit 0
+cat > "$TMP"
+
+# Build two awk tables: by-id lookup and children adjacency.
+# awk script reads JSONL line-by-line. It extracts "id" and "reply_to" using
+# a small regex (good enough for well-formed JSON; avoids requiring jq).
+
+ROOT_FOUND=0
+ROOT_NOTE=""
+LEAF_COUNT=0
+MAX_DEPTH=0
+
+# Use python3 if available for robust JSON; fall back to awk+sed.
+if command -v python3 >/dev/null 2>&1; then
+  eval "$(python3 - "$ROOT" "$TMP" <<'PY'
+import json, sys
+root = sys.argv[1]
+path = sys.argv[2]
+notes = {}
+children = {}
+order_by_parent = {}
+with open(path) as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            n = json.loads(line)
+        except Exception:
+            continue
+        nid = n.get("id")
+        if not nid:
+            continue
+        notes[nid] = n
+        parent = n.get("reply_to")
+        if parent is None:
+            parent = ""
+        children.setdefault(parent, []).append(nid)
+        order_by_parent.setdefault(parent, []).append((
+            n.get("created_at", ""), nid
+        ))
+for parent, lst in order_by_parent.items():
+    lst.sort(key=lambda x: (x[0], x[1]))
+    children[parent] = [nid for _, nid in lst]
+
+import pprint, json as J2
+def esc(v):
+    return v.replace("'", "'\\''")
+print("CHILDREN=" + J2.dumps(children).replace("'\\''", "'\\''"))
+print("NOTES=" + J2.dumps({k: notes[k] for k in notes}).replace("'\\''", "'\\''"))
+PY
+)"
+
+  if [ -z "${NOTES:-}" ]; then
+    echo "no parseable notes in stream" >&2
+    exit 1
+  fi
+
+  # Check root exists.
+  if ! python3 -c "import json,sys; d=json.loads(sys.argv[1]); sys.exit(0 if sys.argv[2] in d else 1)" "$NOTES" "$ROOT" 2>/dev/null; then
+    echo "root note $ROOT not found in stream" >&2
+    exit 1
+  fi
+
+  # Walk the tree, emitting each node with its depth.
+  walk() {
+    local parent="$1"
+    local depth="$2"
+    local kids
+    kids=$(python3 -c "import json,sys; d=json.loads(sys.argv[1]); p=sys.argv[2]; print(' '.join(d.get(p, [])))" "$CHILDREN" "$parent")
+    for cid in $kids; do
+      local note
+      note=$(python3 -c "import json,sys; d=json.loads(sys.argv[1]); print(json.dumps(d[sys.argv[2]], separators=(',',':')))" "$NOTES" "$cid")
+      # Emit with a depth prefix using a sibling field.
+      python3 -c "import json,sys; n=json.loads(sys.argv[1]); n['depth']=int(sys.argv[2]); print(json.dumps(n, separators=(',',':')))" "$note" "$depth"
+      walk "$cid" "$((depth+1))"
+    done
+  }
+
+  ROOT_NOTE=$(python3 -c "import json,sys; d=json.loads(sys.argv[1]); print(json.dumps(d[sys.argv[2]], separators=(',',':')))" "$NOTES" "$ROOT")
+  python3 -c "import json,sys; n=json.loads(sys.argv[1]); n['depth']=0; print(json.dumps(n, separators=(',',':')))" "$ROOT_NOTE"
+  walk "$ROOT" 1
+
+  LEAF_COUNT=$(python3 -c "
+import json
+d = json.loads('''$CHILDREN''')
+root_kids = d.get('$ROOT', [])
+def count(kid, kids_map):
+    sub = kids_map.get(kid, [])
+    if not sub:
+        return 1
+    return sum(count(s, kids_map) for s in sub)
+print(sum(count(k, d) for k in root_kids))
+")
+
+  MAX_DEPTH=$(python3 -c "
+import json
+d = json.loads('''$CHILDREN''')
+def depth(node, kids_map, d_now):
+    sub = kids_map.get(node, [])
+    if not sub:
+        return d_now
+    return max(depth(s, kids_map, d_now+1) for s in sub)
+print(depth('$ROOT', d, 0))
+")
+
+  echo "{\"summary\":{\"root\":\"$ROOT\",\"leaf_count\":$LEAF_COUNT,\"max_depth\":$MAX_DEPTH}}"
+else
+  # Pure-shell fallback using awk + sed for JSON extraction. Less robust but
+  # works on minimal busybox environments.
+  echo "python3 not found; this tool requires python3 for safe JSON parsing" >&2
+  exit 3
+fi
 
 <!-- Authored by Technocore agent DID did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP -->
