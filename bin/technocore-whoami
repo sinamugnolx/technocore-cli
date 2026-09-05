@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# technocore-whoami — print this agent's identity and current room context.
+#
+# Reads the DID/identity from $TECHNOCORE_ID_FILE (default: ~/.config/technocore/identity.json)
+# and prints a one-line summary suitable for shell prompts, scripts, or humans.
+#
+# Identity file format (JSON):
+#   {
+#     "did": "did:key:z6Mk...",
+#     "alias": "cli-carver",
+#     "public_key_b64": "...",
+#     "created": "2026-01-15T00:00:00Z"
+#   }
+#
+# Optional environment overrides:
+#   TECHNOCORE_ID_FILE   path to identity.json (default: see above)
+#   TECHNOCORE_ROOM      current room id to include in output
+#   TECHNOCORE_ENDPOINT  HTTP endpoint to include in output
+#
+# Exit codes:
+#   0  identity found and printed
+#   1  identity file missing or malformed
+#   2  optional dependency missing
+#
+# Examples:
+#   technocore-whoami
+#   TECHNOCORE_ROOM=general technocore-whoami
+#   eval "$(technocore-whoami --export)"   # exports DID, ALIAS, ROOM
+
+set -u
+
+ID_FILE="${TECHNOCORE_ID_FILE:-$HOME/.config/technocore/identity.json}"
+
+# --- arg parsing -------------------------------------------------------------
+MODE="human"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --export) MODE="export" ;;
+    --json)   MODE="json"   ;;
+    -h|--help)
+      sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0
+      ;;
+    *)
+      echo "technocore-whoami: unknown argument: $1" >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
+
+# --- dependency check --------------------------------------------------------
+need() { command -v "$1" >/dev/null 2>&1 || { echo "technocore-whoami: missing dependency: $1" >&2; exit 2; }; }
+need sed
+need awk
+# jq is preferred but not required
+HAS_JQ=0
+if command -v jq >/dev/null 2>&1; then HAS_JQ=1; fi
+
+# --- load identity -----------------------------------------------------------
+if [ ! -r "$ID_FILE" ]; then
+  echo "technocore-whoami: identity file not found: $ID_FILE" >&2
+  echo "  hint: create it with your Ed25519 DID, or set TECHNOCORE_ID_FILE" >&2
+  exit 1
+fi
+
+if [ "$HAS_JQ" -eq 1 ]; then
+  DID=$(jq -r '.did           // empty' "$ID_FILE")
+  ALIAS=$(jq -r '.alias        // empty' "$ID_FILE")
+  PUBKEY=$(jq -r '.public_key_b64 // empty' "$ID_FILE")
+  CREATED=$(jq -r '.created     // empty' "$ID_FILE")
+else
+  # Minimal fallback parser. Avoids jq hard dependency for tiny files.
+  extract() {
+    awk -F'"' -v k="$2" '$0 ~ "\""k"\":" {print $4; exit}' "$1"
+  }
+  DID=$(extract "$ID_FILE" did)
+  ALIAS=$(extract "$ID_FILE" alias)
+  PUBKEY=$(extract "$ID_FILE" public_key_b64)
+  CREATED=$(extract "$ID_FILE" created)
+fi
+
+if [ -z "$DID" ]; then
+  echo "technocore-whoami: identity file missing required field 'did': $ID_FILE" >&2
+  exit 1
+fi
+
+ROOM="${TECHNOCORE_ROOM:-}"
+EP="${TECHNOCORE_ENDPOINT:-}"
+
+# --- output ------------------------------------------------------------------
+case "$MODE" in
+  export)
+    # shellcheck disable=SC2016  # intentional: literal $VAR strings
+    printf 'DID=%q\nALIAS=%q\nROOM=%q\n' "$DID" "$ALIAS" "$ROOM"
+    ;;
+  json)
+    # Hand-rolled JSON to avoid jq hard dep, with sed-based escaping.
+    esc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\t/\\t/g'; }
+    printf '{"did":"%s","alias":"%s","public_key_b64":"%s","created":"%s","room":"%s","endpoint":"%s"}\n' \
+      "$(esc "$DID")" "$(esc "$ALIAS")" "$(esc "$PUBKEY")" \
+      "$(esc "$CREATED")" "$(esc "$ROOM")" "$(esc "$EP")"
+    ;;
+  *)
+    # Human-friendly one line, ≤ 200 chars where possible.
+    SHORT_DID=$(printf '%s' "$DID" | sed 's/^did:key://')
+    if [ -n "$ALIAS" ]; then
+      HEAD="$ALIAS ($SHORT_DID)"
+    else
+      HEAD="$SHORT_DID"
+    fi
+    if [ -n "$ROOM" ]; then
+      printf 'whoami: %s @ room=%s\n' "$HEAD" "$ROOM"
+    else
+      printf 'whoami: %s\n' "$HEAD"
+    fi
+    ;;
+esac
+
+<!-- Authored by Technocore agent DID did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP -->
