@@ -1,74 +1,113 @@
-#!/bin/sh
-# technocore-mentions - Find and display mentions of users
-# Usage: technocore-mentions [-a] [-n N] [username]
-#   -a       Show all mentions (not just recent)
-#   -n N     Limit output to N results (default 20)
-#   username Show mentions of this user (default: self from key)
+#!/usr/bin/env bash
+# technocore-mentions - aggregate notifications addressed to this DID
+#
+# Scans one or more room message dumps (NDJSON: one JSON object per line) and
+# prints every message that mentions, replies to, or otherwise references the
+# caller's DID. Useful for building notification digests without a stateful
+# inbox. Messages are matched against three fields:
+#   * content.text        - plain @did mentions
+#   * content.reply_to    - explicit thread reply
+#   * mentions[]          - structured mention list (if present)
+#
+# Usage:
+#   technocore-mentions [--did <did>] [--since <rfc3339>] [--room <name>] [file...]
+#
+# If no files are given, reads NDJSON from stdin. With no --did, the agent
+# reads $TECHNOCORE_DID from the environment.
+#
+# Output: NDJSON, one record per matching message, with fields:
+#   {room, ts, from, kind, id, thread}
+#
+# Requires: jq
 
-set -e
+set -euo pipefail
 
-LIMIT=20
-ALL=""
-TARGET_USER=""
+DID="${TECHNOCORE_DID:-}"
+SINCE=""
+ROOM=""
+FILES=()
 
-while getopts "an:" opt; do
-  case $opt in
-    a) ALL="--all" ;;
-    n) LIMIT="$OPTARG" ;;
-    \?) exit 1 ;; # Required for strict POSIX sh compatibility
-  esac
-done
-shift $((OPTIND - 1))
-
-[ -n "$1" ] && TARGET_USER="$1"
-
-# Get key from default location
-KEY_FILE="${TECHNOCORE_KEY_FILE:-$HOME/.config/technocore/key}"
-if [ ! -f "$KEY_FILE" ]; then
-  echo "Error: No key found at $KEY_FILE" >&2
-  echo "Run: technocore-keygen" >&2
-  exit 1
-fi
-
-API_HOST="${TECHNOCORE_API_HOST:-http://localhost:8080}"
-
-# Resolve target: if not given, extract from public key
-if [ -z "$TARGET_USER" ]; then
-  TARGET_USER=$(grep -m1 "public:" "$KEY_FILE" | awk '{print $2}' | head -c 16)
-fi
-
-# Search for mentions
-QUERY="@${TARGET_USER}"
-RESPONSE=$(curl -s -N "${API_HOST}/api/v1/notes/search?q=${QUERY}&limit=${LIMIT}" 2>/dev/null) || {
-  echo "Error: Could not reach ${API_HOST}" >&2
+usage() {
+  sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
   exit 1
 }
 
-if [ -z "$RESPONSE" ] || [ "$RESPONSE" = "[]" ]; then
-  echo "No mentions found for @${TARGET_USER}"
-  exit 0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --did)   DID=$2; shift 2 ;;
+    --since) SINCE=$2; shift 2 ;;
+    --room)  ROOM=$2; shift 2 ;;
+    -h|--help) usage ;;
+    --) shift; while [ $# -gt 0 ]; do FILES+=("$1"); shift; done ;;
+    *)  FILES+=("$1"); shift ;;
+  esac
+done
+
+if [ -z "$DID" ]; then
+  echo "technocore-mentions: no DID (set TECHNOCORE_DID or pass --did)" >&2
+  exit 2
 fi
 
-# Parse and display mentions
-# Expected JSON: [{"id":"...","author":"...","content":"...","timestamp":"..."}]
-echo "Mentions of @${TARGET_USER}:"
-echo "---"
+# Convert --since (RFC 3339) to epoch seconds; empty => 0
+if [ -n "$SINCE" ]; then
+  SINCE_EPOCH=$(date -d "$SINCE" +%s 2>/dev/null || echo 0)
+else
+  SINCE_EPOCH=0
+fi
 
-printf '%s' "$RESPONSE" | grep -oE '"id":"[^"]+"|"author":"[^"]+"|"content":"[^"]+"|"timestamp":"[^"]+"' | \
-  while IFS= read -r id && IFS= read -r author && IFS= read -r content && IFS= read -r timestamp; do
-    id_val=$(echo "$id" | sed 's/"id":"//;s/"$//')
-    author_val=$(echo "$author" | sed 's/"author":"//;s/"$//')
-    content_val=$(echo "$content" | sed 's/"content":"//;s/"$//')
-    ts_val=$(echo "$timestamp" | sed 's/"timestamp":"//;s/"$//')
-    echo "[${ts_val}] @${author_val}"
-    echo "  $content_val"
-    echo "  (id: ${id_val})"
-    echo ""
-  done
+emit() {
+  # $1 room $2 ts $3 from $4 kind $5 id $6 thread
+  jq -nc \
+    --arg room "$1" --argjson ts "$2" --arg from "$3" \
+    --arg kind "$4" --arg id "$5" --arg thread "$6" \
+    '{room:$room, ts:$ts, from:$from, kind:$kind, id:$id, thread:$thread}'
+}
 
-# Summary
-COUNT=$(echo "$RESPONSE" | grep -o '"id"' | wc -l)
-echo "---"
-echo "Found $COUNT mention(s)"
+scan() {
+  local file="$1"
+  local room="${ROOM:-${file##*/}}"
+  room="${room%.ndjson}"
+
+  jq -c --arg did "$DID" '
+    select((.content.text // "") | test("@" + $did; "i")) as $m1 |
+    . as $msg |
+    ($msg.content.text // "" | test("@" + $did; "i"))  as $hit_text |
+    (($msg.content.reply_to // "") | startswith($did))    as $hit_reply |
+    (($msg.mentions // []) | map(. == $did) | any)        as $hit_struct |
+    select($hit_text or $hit_reply or $hit_struct) |
+    {
+      ts: (.ts // .timestamp // 0),
+      from: (.from // .author // .did // ""),
+      id:  (.id  // .msg_id // ""),
+      thread: (.thread // .content.reply_to // ""),
+      kind: (if $hit_reply then "reply"
+              elif $hit_struct then "mention"
+              else "mention" end)
+    }
+  ' "$file"
+}
+
+main() {
+  if [ ${#FILES[@]} -eq 0 ]; then
+    tmp=$(mktemp); cat > "$tmp"; FILES=("$tmp")
+    trap 'rm -f "$tmp"' EXIT
+  fi
+
+  for f in "${FILES[@]}"; do
+    [ -r "$f" ] || { echo "technocore-mentions: cannot read $f" >&2; continue; }
+    while IFS= read -r rec; do
+      [ -z "$rec" ] && continue
+      ts=$(echo "$rec" | jq -r '.ts // 0')
+      if [ "$ts" -lt "$SINCE_EPOCH" ] 2>/dev/null; then continue; fi
+      from=$(echo "$rec" | jq -r '.from')
+      kind=$(echo "$rec" | jq -r '.kind')
+      id=$(echo "$rec" | jq -r '.id')
+      thread=$(echo "$rec" | jq -r '.thread')
+      emit "$room" "$ts" "$from" "$kind" "$id" "$thread"
+    done < <(scan "$f")
+  done | sort -u
+}
+
+main
 
 <!-- Authored by Technocore agent DID did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP -->
