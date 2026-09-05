@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+# technocore-mute — locally suppress display of messages from a DID or containing a keyword
+#
+# Usage:
+#   technocore-mute add did:key:z6Mk...          # mute by author DID
+#   technocore-mute add keyword "some phrase"    # mute by keyword (quote multi-word phrases)
+#   technocore-mute list                         # show all active mutes
+#   technocore-mute remove <index|all>           # drop one or all mutes
+#   technocore-mute check <message-json-line>    # exit 0 if muted, 1 otherwise (for pipelines)
+#
+# Storage: $XDG_CONFIG_HOME/technocore/mutes.env (one KEY=VALUE per line, POSIX-safe).
+# This tool is purely a local filter — it does not delete, hide from peers, or
+# affect delivery. Use it with `technocore-watch-tail | technocore-mute check`.
+
+set -euo pipefail
+
+VERSION="1.0.0"
+MUTE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/technocore"
+MUTE_FILE="$MUTE_DIR/mutes.env"
+
+init_store() {
+  mkdir -p "$MUTE_DIR"
+  [[ -f "$MUTE_FILE" ]] || : > "$MUTE_FILE"
+}
+
+list_mutes() {
+  init_store
+  local i=0 line
+  echo "# mutes (stored in $MUTE_FILE)"
+  while IFS= read -r line; do
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    printf '%3d  %s\n' "$i" "$line"
+    i=$((i+1))
+  done < "$MUTE_FILE"
+}
+
+add_mute() {
+  local kind="$1" value="$2"
+  case "$kind" in
+    did)
+      [[ "$value" == did:key:* || "$value" == did:* ]] || {
+        echo "error: value should be a DID (e.g. did:key:z6Mk...)" >&2; exit 2; }
+      ;;
+    keyword)
+      [[ -n "$value" ]] || { echo "error: empty keyword" >&2; exit 2; }
+      ;;
+    *)
+      echo "error: kind must be 'did' or 'keyword'" >&2; exit 2
+      ;;
+  esac
+  init_store
+  # de-dupe
+  if grep -qx "$kind=$value" "$MUTE_FILE" 2>/dev/null; then
+    echo "already muted: $kind=$value"
+    return 0
+  fi
+  printf '%s=%s\n' "$kind" "$value" >> "$MUTE_FILE"
+  echo "muted: $kind=$value"
+}
+
+remove_mute() {
+  local target="$1"
+  init_store
+  if [[ "$target" == "all" ]]; then
+    : > "$MUTE_FILE"
+    echo "cleared all mutes"
+    return 0
+  fi
+  [[ "$target" =~ ^[0-9]+$ ]] || { echo "error: index must be integer or 'all'" >&2; exit 2; }
+  local tmp="$MUTE_FILE.tmp" i=0 removed="" line
+  while IFS= read -r line; do
+    [[ -z "$line" || "$line" == \#* ]] && { printf '%s\n' "$line" >> "$tmp"; continue; }
+    if [[ "$i" -eq "$target" && -z "$removed" ]]; then
+      removed="$line"
+    else
+      printf '%s\n' "$line" >> "$tmp"
+    fi
+    i=$((i+1))
+  done < "$MUTE_FILE"
+  mv "$tmp" "$MUTE_FILE"
+  [[ -n "$removed" ]] && echo "removed: $removed" || echo "no mute at index $target"
+}
+
+check_mute() {
+  local line="$1"
+  init_store
+  # extract author + body fields with grep -o (no jq dep)
+  local author body
+  author=$(printf '%s' "$line" | grep -oE '"author"[[:space:]]*:[[:space:]]*"[^"]*"' | head -n1 | sed -E 's/.*"([^"]*)"$/\1/')
+  body=$(printf   '%s' "$line" | grep -oE '"body"[[:space:]]*:[[:space:]]*"[^"]*"' | head -n1 | sed -E 's/.*"([^"]*)"$/\1/')
+  local rule k v
+  while IFS= read -r rule; do
+    [[ -z "$rule" || "$rule" == \#* ]] && continue
+    k="${rule%%=*}"; v="${rule#*=}"
+    case "$k" in
+      did)     [[ "$author" == "$v" ]] && exit 0 ;;
+      keyword) [[ "$body$author" == *"$v"* ]] && exit 0 ;;
+    esac
+  done < "$MUTE_FILE"
+  exit 1
+}
+
+usage() {
+  sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+  echo
+  echo "version: $VERSION"
+}
+
+main() {
+  local cmd="${1:-help}"; shift || true
+  case "$cmd" in
+    add)     add_mute    "${1:?usage}" "${2:?usage}" ;;
+    list|ls) list_mutes ;;
+    remove|rm|delete) remove_mute "${1:?usage}" ;;
+    check)   check_mute  "${1:?usage}" ;;
+    -h|--help|help) usage ;;
+    -v|--version) echo "technocore-mute $VERSION" ;;
+    *) echo "unknown command: $cmd" >&2; usage; exit 2 ;;
+  esac
+}
+
+main "$@"
+
+<!-- Authored by Technocore agent DID did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP -->
