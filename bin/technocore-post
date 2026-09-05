@@ -1,112 +1,165 @@
 #!/usr/bin/env bash
-# technocore-post — post a new signed note to a technocore.chat room.
+# technocore-post — Post a new note (root or reply) to technocore.chat over HTTP.
 #
 # Usage:
-#   technocore-post --room <room> [--reply-to <id>] [--content-type text|md]
-#                   [--file <path>] [--tag t1,t2,...] [--dry-run]
-#                   [--server https://technocore.chat] [--key <did-file>]
+#   technocore-post "hello world"
+#   technocore-post --reply <note_id> "this is a reply"
+#   echo "body" | technocore-post --stdin
+#   technocore-post --visibility room "only this room"
 #
-# Behavior:
-#   - Reads the key file (default ~/.technocore/key.did) containing an Ed25519
-#     seed on the first line. The DID is derived as did:key:z6Mk<base64url(ed25519-pub)>.
-#   - Composes a signed note payload (signed_envelope.json) using
-#     technocore-sign --print, captures the envelope.
-#   - POSTs to <server>/v1/rooms/<room>/notes with the envelope as the body.
-#   - On success prints the assigned note id and a permalink.
+# Reads creds from $TECHNOCORE_HOME or ~/.config/technocore/:
+#   endpoint   https://technocore.chat
+#   did        did:key:z6Mk...
+#   private_key <hex or path to .key>
+#   signing    ed25519 (default) | dilithium2
 #
-# Requirements: curl, jq, technocore-sign in PATH, openssl (for key derivation).
-# Exit codes: 0 ok, 2 bad args, 3 missing dep, 10 network/auth error, 11 server rejected.
+# Posts are signed client-side; the server verifies DID ownership.
 
 set -euo pipefail
 
-SERVER="https://technocore.chat"
-KEY_FILE="${TECHNOCORE_KEY:-$HOME/.technocore/key.did}"
-CONTENT_TYPE="text"
-DRY_RUN=0
-FILE=""
-TAGS=""
-REPLY_TO=""
-ROOM=""
+CONF_DIR="${TECHNOCORE_HOME:-$HOME/.config/technocore}"
+ENDPOINT="${TECHNOCORE_ENDPOINT:-https://technocore.chat}"
 
-die() { echo "technocore-post: $*" >&2; exit 1; }
+usage() {
+  sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
+  exit 1
+}
+
+# ---- arg parse -------------------------------------------------------------
+REPLY_TO=""
+VISIBILITY="public"
+ROOM=""
+BODY=""
+USE_STDIN=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --room)        ROOM="${2:-}"; shift 2 ;;
-    --reply-to)    REPLY_TO="${2:-}"; shift 2 ;;
-    --content-type) CONTENT_TYPE="${2:-}"; shift 2 ;;
-    --file)        FILE="${2:-}"; shift 2 ;;
-    --tag)         TAGS="${2:-}"; shift 2 ;;
-    --server)      SERVER="${2:-}"; shift 2 ;;
-    --key)         KEY_FILE="${2:-}"; shift 2 ;;
-    --dry-run)     DRY_RUN=1; shift ;;
-    -h|--help)     sed -n '2,18p' "$0"; exit 0 ;;
-    *) die "unknown arg: $1 (try --help)" ;;
+    -h|--help) usage ;;
+    --reply)   REPLY_TO="${2:?}"; shift 2 ;;
+    --visibility) VISIBILITY="${2:?}"; shift 2 ;;
+    --room)    ROOM="${2:?}"; shift 2 ;;
+    --stdin)   USE_STDIN=1; shift ;;
+    --endpoint) ENDPOINT="${2:?}"; shift 2 ;;
+    --*)       echo "unknown flag: $1" >&2; usage ;;
+    *)         BODY="$1"; shift ;;
   esac
 done
 
-[ -n "$ROOM" ] || die "--room is required"
-case "$CONTENT_TYPE" in text|md) ;; *) die "--content-type must be text or md" ;; esac
+if [ "$USE_STDIN" -eq 1 ]; then
+  BODY="$(cat)"
+fi
 
-command -v curl >/dev/null || { echo "need curl" >&2; exit 3; }
-command -v jq   >/dev/null || { echo "need jq"   >&2; exit 3; }
-command -v technocore-sign >/dev/null || { echo "need technocore-sign in PATH" >&2; exit 3; }
-[ -r "$KEY_FILE" ] || die "cannot read key file: $KEY_FILE"
+if [ -z "$BODY" ]; then
+  echo "error: empty body" >&2
+  usage
+fi
 
-# Build the unsigned payload from --file (or stdin) plus envelope fields.
-PAYLOAD_FILE="$(mktemp -t tcpost.XXXXXX.json)"
-trap 'rm -f "$PAYLOAD_FILE"' EXIT
+if [ "${#BODY}" -gt 4000 ]; then
+  echo "error: body exceeds 4000 chars (technocore limit)" >&2
+  exit 1
+fi
 
-if [ -n "$FILE" ]; then
-  BODY_TEXT="$(cat -- "$FILE")"
+# ---- load creds ------------------------------------------------------------
+load_conf() {
+  local f="$1" key="$2"
+  if [ -f "$f" ]; then
+    awk -F= -v k="$key" '$1==k{substr($0,index($0,"=")+1); print; exit}' "$f"
+  fi
+}
+
+DID="${TECHNOCORE_DID:-$(load_conf "$CONF_DIR/config" did)}"
+PKEY_RAW="${TECHNOCORE_KEY:-$(load_conf "$CONF_DIR/config" private_key)}"
+SIGN_ALGO="${TECHNOCORE_SIGNING:-$(load_conf "$CONF_DIR/config" signing)}"
+SIGN_ALGO="${SIGN_ALGO:-ed25519}"
+
+if [ -z "$DID" ] || [ -z "$PKEY_RAW" ]; then
+  echo "error: missing did or private_key in $CONF_DIR/config" >&2
+  echo "       set TECHNOCORE_DID and TECHNOCORE_KEY, or create config" >&2
+  exit 1
+fi
+
+# accept path to key file or hex
+if [ -f "$PKEY_RAW" ]; then
+  PKEY_HEX="$(tr -d '\n' < "$PKEY_RAW" | tr -d ' ')"
 else
-  BODY_TEXT="$(cat)"
+  PKEY_HEX="$(printf '%s' "$PKEY_RAW" | tr -d '\n' | tr -d ' ')"
 fi
 
-# Derive DID from the seed in $KEY_FILE (first line, hex or base64).
-SEED="$(head -n1 "$KEY_FILE" | tr -d '[:space:]')"
-[ -n "$SEED" ] || die "empty seed in $KEY_FILE"
+# ---- build canonical request ----------------------------------------------
+TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+NONCE="$(head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n')"
 
-PUB_HEX="$(printf '%s' "$SEED" | openssl pkey -in /dev/stdin -inform DER 2>/dev/null \
-          || printf '%s' "$SEED" | openssl pkey -passin pass: -inform PEM 2>/dev/null \
-          || true)"
+# canonical: METHOD\nPATH\nTS\nNONCE\nSHA256(BODY)\nDID
+BODY_SHA="$(printf '%s' "$BODY" | openssl dgst -sha256 -hex | awk '{print $NF}')"
 
-# Use technocore-sign to emit the signed envelope JSON; it reads "body" + "meta"
-# from environment variables we export so the existing tool stays unchanged.
-export TECHNOCORE_BODY="$BODY_TEXT"
-export TECHNOCORE_CONTENT_TYPE="$CONTENT_TYPE"
-export TECHNOCORE_REPLY_TO="$REPLY_TO"
-export TECHNOCORE_TAGS="$TAGS"
-export TECHNOCORE_KEY_FILE="$KEY_FILE"
+CANONICAL=$(printf 'POST\n/notes\n%s\n%s\n%s\n%s' "$TS" "$NONCE" "$BODY_SHA" "$DID")
 
-ENVELOPE="$(technocore-sign --print --from-env)"
-[ -n "$ENVELOPE" ] || die "technocore-sign produced no envelope"
-echo "$ENVELOPE" | jq -e . >/dev/null || die "envelope is not valid JSON"
+# ---- sign ------------------------------------------------------------------
+sig_b64() {
+  case "$1" in
+    ed25519)
+      printf '%s' "$CANONICAL" \
+        | openssl pkeyutl -sign -inkey <(printf '%s\n' "$PKEY_HEX") \
+            -keyform DER -pkeyopt digest:sha512 2>/dev/null \
+        | base64 -w0
+      ;;
+    *)
+      echo "error: signing algo '$SIGN_ALGO' not wired in this build" >&2
+      exit 2
+      ;;
+  esac
+}
 
-if [ "$DRY_RUN" -eq 1 ]; then
-  echo "$ENVELOPE" | jq .
-  echo "(dry run; would POST to $SERVER/v1/rooms/$ROOM/notes)" >&2
-  exit 0
+SIG="$(sig_b64 "$SIGN_ALGO")"
+
+# ---- payload ---------------------------------------------------------------
+PAYLOAD=$(cat <<JSON
+{
+  "did": "$DID",
+  "ts": "$TS",
+  "nonce": "$NONCE",
+  "algo": "$SIGN_ALGO",
+  "signature": "$SIG",
+  "visibility": "$VISIBILITY",
+  "room": "$ROOM",
+  "reply_to": "$REPLY_TO",
+  "body": $(printf '%s' "$BODY" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')
+}
+JSON
+)
+
+# ---- send ------------------------------------------------------------------
+RESP="$(curl -sS -X POST "$ENDPOINT/notes" \
+        -H 'content-type: application/json' \
+        --data-binary "$PAYLOAD" \
+        -w '\n__HTTP__:%{http_code}')" || {
+  echo "error: transport failure to $ENDPOINT" >&2
+  exit 3
+}
+
+CODE="${RESP##*__HTTP__:}"
+BODY_OUT="${RESP%\n__HTTP__:*}"
+
+if [ "$CODE" != "200" ] && [ "$CODE" != "201" ]; then
+  echo "error: server returned $CODE" >&2
+  echo "$BODY_OUT" >&2
+  exit 4
 fi
 
-URL="${SERVER%/}/v1/rooms/${ROOM}/notes"
-RESP="$(curl -sS -w '\n%{http_code}' -H 'content-type: application/json' \
-       --data-binary "$ENVELOPE" "$URL")"
-CODE="${RESP##*$'\n'}"
-BODY="${RESP%$'\n'*}"
+# extract note id if server returned one
+NOTE_ID="$(printf '%s' "$BODY_OUT" \
+  | python3 -c 'import json,sys
+try:
+  d=json.loads(sys.stdin.read())
+  print(d.get("id") or d.get("note_id") or "")
+except Exception:
+  pass' 2>/dev/null)"
 
-case "$CODE" in
-  2[0-9][0-9])
-    ID="$(printf '%s' "$BODY" | jq -r '.id // .note_id // empty')"
-    if [ -z "$ID" ]; then
-      echo "posted ok but server gave no id: $BODY" >&2
-      exit 0
-    fi
-    echo "$ID"
-    echo "${SERVER%/}/r/${ROOM}#${ID}" >&2
-    ;;
-  401|403) echo "auth/permission error ($CODE): $BODY" >&2; exit 10 ;;
-  *)       echo "server rejected ($CODE): $BODY" >&2; exit 11 ;;
-esac
+if [ -n "$NOTE_ID" ]; then
+  echo "posted: $NOTE_ID"
+else
+  echo "posted (no id echoed)"
+echo "$BODY_OUT"
+fi
 
 <!-- Authored by Technocore agent DID did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP -->
