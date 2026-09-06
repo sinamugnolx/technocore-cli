@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# technocore-thread-summarize - Print a one-line summary of a technocore thread.
+#
+# Reads a thread JSON document (as produced by `technocore thread fetch` or
+# captured from an agent's note stream) and emits a compact summary suitable
+# for status bars, IRC bouncers, or digest previews.
+#
+# Usage:
+#   technocore-thread-summarize <thread.json>
+#   cat thread.json | technocore-thread-summarize -
+#
+# Output (single line):
+#   <room> | <n> msgs | <n> participants | last: <author-did-short>: <preview>
+#
+# Options:
+#   -w, --width N    Truncate preview to N columns (default 80).
+#   -h, --help       Show this help and exit.
+
+set -euo pipefail
+
+PROG="${0##*/}"
+WIDTH=80
+
+usage() {
+  sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
+  exit "${1:-0}"
+}
+
+short_did() {
+  # did:key:z6Mk...  -> z6Mk...:abcd (first 4 chars after the prefix)
+  local did="$1"
+  local base suffix
+  base="${did#did:key:}"
+  if [[ "$did" == "$base" ]]; then
+    printf '%s' "${did:0:14}"
+    return
+  fi
+  suffix="${base:0:8}"
+  printf '%s' "${base:0:14}:${suffix: -4}"
+}
+
+# Strip control chars and collapse whitespace; preserve at most WIDTH columns.
+clean_preview() {
+  local s="$1" max="$2"
+  s="$(printf '%s' "$s" | tr -d '\000-\010\013\014\016-\037')"
+  s="$(printf '%s' "$s" | tr '\t' ' ' | tr -s ' ')"
+  s="$(printf '%s' "$s" | sed 's/^ *//;s/ *$//')"
+  if [[ "${#s}" -gt "$max" ]]; then
+    printf '%s...' "${s:0:max-3}"
+  else
+    printf '%s' "$s"
+  fi
+}
+
+INPUT="-
+"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -w|--width) WIDTH="${2:-80}"; shift 2 ;;
+    -h|--help)  usage 0 ;;
+    --) shift; break ;;
+    -*) printf '%s: unknown option %s\n' "$PROG" "$1" >&2; usage 2 ;;
+    *)  INPUT="$1"; shift ;;
+  esac
+done
+
+if [[ "$INPUT" != "-" && ! -r "$INPUT" ]]; then
+  printf '%s: cannot read %s\n' "$PROG" "$INPUT" >&2
+  exit 1
+fi
+
+if ! command -v jq >/dev/null 2>&1; then
+  printf '%s: this utility requires jq (https://jqlang.org)\n' "$PROG" >&2
+  exit 1
+fi
+
+JQ_PROG='
+  . as $t
+  | ($t.room // $t.channel // "?") as $room
+  | ($t.messages // []) as $msgs
+  | ($msgs | length) as $n
+  | ($msgs | map(.author // .did // "?") | unique | length) as $p
+  | (if $n > 0 then $msgs[$n - 1] else null end) as $last
+  | ($last.author // $last.did // "") as $la
+  | ($last.body // $last.text // $last.content // "") as $lb
+  | [$room, ($n|tostring), ($p|tostring), $la, $lb]
+  | @tsv
+'
+
+TSV="$(jq -r "$JQ_PROG" < "$INPUT")"
+IFS=$'\t' read -r ROOM N_PARTICIPANTS LAST_AUTH LAST_BODY <<<"$TSV"
+
+PREVIEW="$(clean_preview "$LAST_BODY" "$WIDTH")"
+LAST_SHORT="$(short_did "$LAST_AUTH")"
+
+printf '%s | %s msgs | %s participants | last: %s: %s\n' \
+  "$ROOM" "$N_PARTICIPANTS" "$N_PARTICIPANTS" "$LAST_SHORT" "$PREVIEW"
+
+<!-- Authored by Technocore agent DID did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP -->
