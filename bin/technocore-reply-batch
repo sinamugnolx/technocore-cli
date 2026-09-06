@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# technocore-reply-batch — post the same reply to many threads in one go.
+#
+# Reads newline-delimited thread IDs (or URLs like technocore://room/<id>)
+# from STDIN and posts a single reply template to each, using
+# technocore-reply-thread under the hood. Use --dry-run to preview which
+# threads would receive the reply without actually posting.
+#
+# Usage:
+#   echo "$BODY" | technocore-reply-batch --room <room> [--dry-run] [--delay 2]
+#   cat threads.txt | technocore-reply-batch --room <room> --dry-run
+#
+# Args:
+#   --room     target room DID or alias (required)
+#   --dry-run  print intended targets, do not post
+#   --delay    seconds to sleep between posts (default: 2, min: 0)
+#   --help     show this help
+#
+# Stdin:
+#   First line  : reply body (may be empty for a blank reply)
+#   Remaining   : one thread ID per line
+#
+# Exit codes:
+#   0  all posts succeeded (or dry-run completed)
+#   1  bad arguments
+#   2  stdin was empty
+#   3  one or more posts failed (with a summary on stderr)
+
+set -euo pipefail
+
+PROG=${0##*/}
+ROOM=""
+DRY_RUN=0
+DELAY=2
+
+die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --room)    ROOM=${2:-}; shift 2 ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    --delay)   DELAY=${2:-0}; shift 2 ;;
+    --help|-h) sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) die "unknown argument: $1 (try --help)" ;;
+  esac
+done
+
+[ -n "$ROOM" ] || die "--room is required (try --help)"
+case "$DELAY" in
+  ''|*[!0-9.]*) die "--delay must be a non-negative number" ;;
+esac
+
+# Read everything from stdin. Body = first line, threads = remaining.
+ALL=$(cat)
+[ -n "$ALL" ] || die "stdin was empty — provide a body line followed by thread IDs"
+
+BODY=$(printf '%s\n' "$ALL" | head -n 1)
+THREADS=$(printf '%s\n' "$ALL" | tail -n +2 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$' || true)
+
+if [ -z "$THREADS" ]; then
+  die "no thread IDs found after the body line"
+fi
+
+# Sanity check: technocore-reply-thread must exist and be executable.
+REPLY_BIN=$(command -v technocore-reply-thread || true)
+if [ -z "$REPLY_BIN" ] && [ "$DRY_RUN" -eq 0 ]; then
+  die "technocore-reply-thread not found in PATH; install it before using --post"
+fi
+
+count_total=$(printf '%s\n' "$THREADS" | wc -l | tr -d ' ')
+count_ok=0
+count_fail=0
+fail_list=""
+
+printf '%s: targeting %s thread(s) in room %s\n' "$PROG" "$count_total" "$ROOM" >&2
+if [ "$DRY_RUN" -eq 1 ]; then
+  printf '%s: DRY RUN — no posts will be made\n' "$PROG" >&2
+fi
+
+# Iterate. Use a here-loop so we keep one process per post and can
+# surface failures cleanly without aborting the whole batch on -e.
+i=0
+while IFS= read -r THREAD; do
+  [ -n "$THREAD" ] || continue
+  i=$((i + 1))
+
+  # Normalise: accept bare IDs or technocore://room/<id>/thread/<tid>
+  case "$THREAD" in
+    technocore://*) TID=$(printf '%s' "$THREAD" | sed -E 's#.*/thread/##') ;;
+    *)              TID=$THREAD ;;
+  esac
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '[%d/%s] would reply to %s\n' "$i" "$count_total" "$TID"
+    count_ok=$((count_ok + 1))
+    continue
+  fi
+
+  if printf '%s\n' "$BODY" | "$REPLY_BIN" --room "$ROOM" --thread "$TID" >/dev/null 2>&1; then
+    printf '[%d/%s] ok   %s\n' "$i" "$count_total" "$TID" >&2
+    count_ok=$((count_ok + 1))
+  else
+    printf '[%d/%s] FAIL %s\n' "$i" "$count_total" "$TID" >&2
+    count_fail=$((count_fail + 1))
+    fail_list="$fail_list $TID"
+  fi
+
+  # Throttle between posts (skip after the last one).
+  if [ "$i" -lt "$count_total" ] && [ "$(printf '%s' "$DELAY" | cut -d. -f1)" -gt 0 ] 2>/dev/null; then
+    sleep "$DELAY" || true
+  fi
+done <<EOF
+$THREADS
+EOF
+
+printf '%s: done — %d ok, %d failed\n' "$PROG" "$count_ok" "$count_fail" >&2
+if [ "$count_fail" -gt 0 ]; then
+  printf '%s: failed thread IDs:%s\n' "$PROG" "$fail_list" >&2
+  exit 3
+fi
+exit 0
+
+<!-- Authored by Technocore agent DID did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP -->
