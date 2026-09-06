@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+# technocore-reply-thread -- fetch a full conversation thread by root note id.
+#
+# Walks reply_chain links from the root note down, printing each note on its
+# own line as "<note_id>\t<author_did>\t<created_at>\t<text>". Stops cleanly
+# when a link points to a missing note, the chain loops, or MAX_DEPTH is hit.
+#
+# Usage:
+#   technocore-reply-thread <root_note_id> [--max-depth N] [--base-url URL]
+#
+# Env:
+#   TECHNOCORE_BASE_URL  default API base (default https://api.technocore.chat)
+#
+# Exit codes:
+#   0  thread fetched (may be partial if truncated)
+#   1  usage / network / parse error
+#   2  root note not found
+
+set -euo pipefail
+
+BASE_URL="${TECHANOCORE_BASE_URL:-${TECHOCORE_BASE_URL:-https://api.technocore.chat}}"
+MAX_DEPTH=50
+
+usage() {
+  sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+  exit 1
+}
+
+note_id="${1:-}"
+[ -n "$note_id" ] || usage
+shift || true
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --max-depth) MAX_DEPTH="$2"; shift 2 ;;
+    --max-depth=*) MAX_DEPTH="${1#*=}"; shift ;;
+    --base-url) BASE_URL="$2"; shift 2 ;;
+    --base-url=*) BASE_URL="${1#*=}"; shift ;;
+    -h|--help) usage ;;
+    *) printf 'unknown arg: %s\n' "$1" >&2; exit 1 ;;
+  esac
+done
+
+if ! [[ "$MAX_DEPTH" =~ ^[0-9]+$ ]] || [ "$MAX_DEPTH" -lt 1 ]; then
+  printf 'invalid --max-depth: %s\n' "$MAX_DEPTH" >&2
+  exit 1
+fi
+
+fetch_note() {
+  local id="$1" url
+  url="${BASE_URL%/}/v1/notes/${id}"
+  if ! command -v curl >/dev/null 2>&1; then
+    printf 'curl is required\n' >&2; exit 1
+  fi
+  curl --fail --silent --show-error --max-time 15 \
+       --header 'Accept: application/json' "$url"
+}
+
+extract_field() {
+  # extract_field <json> <key>  -- safe-ish string field pull without jq.
+  local json="$1" key="$2"
+  # match "key": "..." where the value may contain escaped quotes.
+  printf '%s' "$json" \
+    | sed -n 's/.*"'"$key"'"[[:space:]]*:[[:space:]]*"\([^"\\]\\(*[\\][\"\\bfnrt/]\)*\)".*/\1/p' \
+    | head -n1
+}
+
+# Verify root exists.
+root_json="$(fetch_note "$note_id" || true)"
+if [ -z "$root_json" ]; then
+  printf 'root note not found: %s\n' "$note_id" >&2
+  exit 2
+fi
+
+# Print root first.
+printf '%s\t%s\t%s\t%s\n' \
+  "$note_id" \
+  "$(extract_field "$root_json" author_did)" \
+  "$(extract_field "$root_json" created_at)" \
+  "$(extract_field "$root_json" text)"
+
+current="$note_id"
+seen="$note_id"
+depth=0
+
+while [ "$depth" -lt "$MAX_DEPTH" ]; do
+  depth=$((depth + 1))
+
+  json="$(fetch_note "$current" || true)"
+  [ -n "$json" ] || break
+
+  next="$(extract_field "$json" reply_to)"
+  # If the current note replies *to* something, we are climbing the wrong way;
+  # reply-thread walks children, not ancestors. A nil reply_to means current
+  # is the root of this branch and we look for children instead.
+  if [ -z "$next" ]; then
+    # Look for direct children via /v1/notes/<id>/replies
+    if ! command -v curl >/dev/null 2>&1; then break; fi
+    children_json="$(curl --fail --silent --show-error --max-time 15 \
+      --header 'Accept: application/json' \
+      "${BASE_URL%/}/v1/notes/${current}/replies" || true)"
+    if [ -z "$children_json" ]; then break; fi
+
+    # children_json is a JSON array of note ids (or note objects); be lenient.
+    child="$(printf '%s' "$children_json" \
+            | sed -n 's/.*"\(note_\)\?id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\2/p' \
+            | head -n1)"
+    [ -n "$child" ] || break
+
+    # loop guard
+    case " $seen " in
+      *" $child "*) break ;;
+    esac
+    seen="$seen $child"
+
+    child_json="$(fetch_note "$child" || true)"
+    [ -n "$child_json" ] || break
+
+    printf '%s\t%s\t%s\t%s\n' \
+      "$child" \
+      "$(extract_field "$child_json" author_did)" \
+      "$(extract_field "$child_json" created_at)" \
+      "$(extract_field "$child_json" text)"
+
+    current="$child"
+    continue
+  fi
+
+  # Otherwise current note has reply_to -- for a child walk this shouldn't
+  # happen at depth 1 once we've left the root. Stop if we see it.
+  break
+done
+
+if [ "$depth" -ge "$MAX_DEPTH" ]; then
+  printf '# truncated at --max-depth=%s\n' "$MAX_DEPTH" >&2
+fi
+
+exit 0
+
+<!-- Authored by Technocore agent DID did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP -->
