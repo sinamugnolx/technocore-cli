@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# technocore-verify-sig - verify Ed25519 signature on a technocore message
+# Usage: technocore-verify-sig <message.json>
+#
+# Reads a technocore message envelope (JSON) containing at minimum:
+#   did     - signer's DID (did:key:z6Mk...)
+#   body    - canonical message body string
+#   sig     - base64url signature bytes
+#
+# Extracts the Ed25519 public key from the did:key, reconstructs the
+# signing payload (body || '\n' || timestamp || '\n' || room), and
+# verifies the signature using openssl pkeyutl (ed25519 supported in
+# OpenSSL >= 3.0 / LibreSSL >= 3.7). Exits 0 on valid signature,
+# 1 on invalid, 2 on missing/invalid input.
+
+set -euo pipefail
+
+if [[ $# -ne 1 ]]; then
+    echo "usage: $0 <message.json>" >&2
+    exit 2
+fi
+
+input="$1"
+[[ -f "$input" ]] || { echo "error: file not found: $input" >&2; exit 2; }
+
+command -v jq    >/dev/null || { echo "error: jq required" >&2; exit 2; }
+command -v openssl >/dev/null || { echo "error: openssl required" >&2; exit 2; }
+
+did=$(jq -r '.did // empty'    "$input")
+body=$(jq -r '.body // empty'   "$input")
+sig=$(jq -r '.sig // empty'     "$input")
+ts=$(jq -r '.ts // empty'      "$input")
+room=$(jq -r '.room // empty'  "$input")
+
+if [[ -z $did || -z $body || -z $sig ]]; then
+    echo "error: message must contain did, body, sig" >&2
+    exit 2
+fi
+
+# Extract the multibase key bytes. did:key Ed25519 looks like:
+#   did:key:z6Mk<base58btc(0xed01 || raw_pubkey)>
+multibase="${did#did:key:}"
+if [[ ${multibase:0:1} != "z" ]]; then
+    echo "error: only z-base multibase did:key supported" >&2
+    exit 2
+fi
+
+# base58btc decode (Bitcoin alphabet, no leading '1' handling beyond char drop)
+b58="$(printf %s "${multibase:1}" | tr -d 'n' | tr -d 'l' | tr -d '0' | tr -d 'I' | tr -d 'O')"
+# Use python for reliable base58 (no shell-only decoder is short & correct).
+raw=$(python3 - "$b58" <<'PY'
+import sys, base64
+ALPH = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+s = sys.argv[1].encode()
+n = 0
+for c in s:
+    n = n*58 + ALPH.index(bytes([c]))
+# convert to bytes
+out = []
+while n > 0:
+    out.append(n & 0xff); n >>= 8
+out.reverse()
+# restore leading zero bytes (each leading '1' = 0x00)
+for c in s:
+    if c == ord('1'): out.insert(0, 0)
+    else: break
+sys.stdout.buffer.write(bytes(out))
+PY
+)
+
+# Strip multicodec prefix for Ed25519 (0xed 0x01)
+if [[ ${#raw} -lt 34 ]]; then
+    echo "error: decoded key too short (${#raw} bytes)" >&2
+    exit 2
+fi
+prefix="${raw:0:2}"
+if [[ $prefix != $'\xed\x01' ]]; then
+    echo "error: not an Ed25519 multicodec key (prefix=$(printf '%s' "$prefix" | xxd -p))" >&2
+    exit 2
+fi
+pubkey_hex=$(printf '%s' "${raw:2}" | xxd -p -c 256)
+
+# Build the canonical signing payload.
+# Format: body \n ts \n room
+payload=$(printf '%s\n%s\n%s' "$body" "$ts" "$room")
+payload_file=$(mktemp); printf '%s' "$payload" > "$payload_file"
+sig_file=$(mktemp); printf '%s' "$sig" | tr '_-' '/+' | base64 -d > "$sig_file"
+pub_file=$(mktemp); printf '%s\n' "-----BEGIN PUBLIC KEY-----"
+# Ed25519 raw 32-byte pubkey -> SPKI DER (46 bytes) then PEM.
+# Easier: use openssl to parse via pkeyutl with raw pub via -keyform DER
+# We wrap in a known-good SPKI header.
+spki_hex="302a300506032b6570032100${pubkey_hex}"
+printf '%s' "$(printf '%s' "$spki_hex" | xxd -r -p)" > "$pub_file.der"
+openssl pkey -pubin -inform DER -in "$pub_file.der" -out "$pub_file" 2>/dev/null
+
+if openssl pkeyutl -verify -pubin -inkey "$pub_file" \
+        -in "$payload_file" -rawin -ed25519 \
+        -sigfile "$sig_file" >/dev/null 2>&1; then
+    echo "OK signature valid for $did"
+    rm -f "$payload_file" "$sig_file" "$pub_file" "$pub_file.der"
+    exit 0
+else
+    echo "FAIL signature invalid for $did" >&2
+    rm -f "$payload_file" "$sig_file" "$pub_file" "$pub_file.der"
+    exit 1
+fi
+
+<!-- Authored by Technocore agent DID did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP -->
