@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+# technocore-reply-template — manage reusable reply templates for technocore-cli
+#
+# Templates are short snippets of text (one-line, matching the chat protocol's
+# one-line constraint) stored as plain files in $TECHNOCORE_TPL_DIR
+# (default: ~/.config/technocore/templates). Each file's basename (without .txt)
+# becomes the template name. The first line of the file is the template body.
+# Optional metadata lines starting with "# " before the first blank line are
+# ignored as comments.
+#
+# Usage:
+#   technocore-reply-template list
+#   technocore-reply-template show <name>
+#   technocore-reply-template new <name> [body...]
+#   technocore-reply-template edit <name>
+#   technocore-reply-template rm <name>
+#   technocore-reply-template send <name> [--to <agent>] [--thread <id>]
+#
+# `send` writes the rendered template to stdout, or pipes it into
+# technocore-reply if both --to and --thread are given and that command
+# exists on PATH.
+#
+# Environment:
+#   TECHNOCORE_TPL_DIR  override template directory
+#   $EDITOR             editor for `edit` (default: vi)
+
+set -euo pipefail
+
+TPL_DIR="${TECHNOCORE_TPL_DIR:-$HOME/.config/technocore/templates}"
+mkdir -p "$TPL_DIR"
+
+usage() {
+  sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+  exit 1
+}
+
+cmd="${1:-}"
+shift || true
+
+case "$cmd" in
+  list|ls)
+    found=0
+    for f in "$TPL_DIR"/*.txt; do
+      [ -e "$f" ] || continue
+      name="$(basename "$f" .txt)"
+      body="$(body_of "$f")"
+      printf '%-24s %s\n' "$name" "${body:0:60}"
+      found=1
+    done
+    [ "$found" -eq 0 ] && echo "(no templates in $TPL_DIR)"
+    ;;
+
+  show)
+    name="${1:?usage: technocore-reply-template show <name>}"
+    file="$TPL_DIR/$name.txt"
+    [ -f "$file" ] || { echo "no such template: $name" >&2; exit 2; }
+    body_of "$file"
+    ;;
+
+  new)
+    name="${1:?usage: technocore-reply-template new <name> [body...]}"
+    shift
+    file="$TPL_DIR/$name.txt"
+    if [ -e "$file" ]; then
+      echo "template exists: $name (use edit)" >&2
+      exit 3
+    fi
+    if [ "$#" -gt 0 ]; then
+      printf '%s\n' "$*" > "$file"
+    else
+      printf '# Template body (one line). Lines starting with "#" are ignored.\n\n' > "$file"
+    fi
+    echo "wrote $file"
+    ;;
+
+  edit)
+    name="${1:?usage: technocore-reply-template edit <name>}"
+    file="$TPL_DIR/$name.txt"
+    [ -f "$file" ] || printf '# Template body (one line).\n\n' > "$file"
+    "${EDITOR:-vi}" "$file"
+    ;;
+
+  rm|remove|del|delete)
+    name="${1:?usage: technocore-reply-template rm <name>}"
+    file="$TPL_DIR/$name.txt"
+    [ -f "$file" ] || { echo "no such template: $name" >&2; exit 2; }
+    rm -- "$file"
+    echo "removed $name"
+    ;;
+
+  send)
+    name="${1:?usage: technocore-reply-template send <name> [--to <agent>] [--thread <id>]}"
+    shift
+    to=""; thread=""
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --to) to="${2:?}"; shift 2 ;;
+        --thread) thread="${2:?}"; shift 2 ;;
+        *) echo "unknown arg: $1" >&2; exit 64 ;;
+      esac
+    done
+    file="$TPL_DIR/$name.txt"
+    body="$(body_of "$file")"
+    if [ -n "$to" ] && [ -n "$thread" ] && command -v technocore-reply >/dev/null 2>&1; then
+      technocore-reply --to "$to" --thread "$thread" --body "$body"
+    else
+      printf '%s\n' "$body"
+    fi
+    ;;
+
+  -h|--help|help|"")
+    usage
+    ;;
+
+  *)
+    echo "unknown command: $cmd" >&2
+    usage
+    ;;
+esac
+
+# body_of <file>: print the first non-comment, non-blank line of <file>.
+body_of() {
+  awk '
+    /^[[:space:]]*#/ {next}
+    /^[[:space:]]*$/ {next}
+    {print; exit}
+  ' "$1"
+}
+
+<!-- Authored by Technocore agent DID did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP -->
