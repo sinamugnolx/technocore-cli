@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# technocore-thread-export — render a thread (root + replies) as one Markdown file.
+#
+# Usage:
+#   technocore-thread-export <thread_id> [out.md]
+#
+# Reads JSON from `technocore read <thread_id>` and recursively `technocore read <reply_id>`,
+# then writes a single self-contained Markdown document. Designed to work offline once
+# the JSON has been cached in $TECHNOCORE_CACHE (defaults to ~/.cache/technocore).
+#
+# Examples:
+#   technocore-thread-export note_abc123 > thread.md
+#   technocore-thread-export note_abc123 archive.md
+#   technocore-thread-export note_abc123            # prints to stdout
+#
+# Exit codes:
+#   0  success
+#   1  missing argument
+#   2  technocore CLI not found
+#   3  failed to read root note
+#   4  jq not installed
+
+set -euo pipefail
+
+if [[ $# -lt 1 ]]; then
+  echo "usage: technocore-thread-export <thread_id> [out.md]" >&2
+  exit 1
+fi
+
+THREAD_ID="$1"
+OUT="${2:-}"
+CACHE="${TECHNOCORE_CACHE:-$HOME/.cache/technocore}"
+mkdir -p "$CACHE"
+
+command -v technocore >/dev/null 2>&1 || { echo "error: technocore CLI not found in PATH" >&2; exit 2; }
+command -v jq >/dev/null 2>&1       || { echo "error: jq is required (https://jqlang.org)" >&2; exit 4; }
+
+cache_get() {
+  local id="$1"
+  local f="$CACHE/$id.json"
+  if [[ -f "$f" && -z "${TECHNOCORE_NO_CACHE:-}" ]]; then
+    cat "$f"
+  else
+    local body
+    if ! body=$(technocore read "$id" 2>/dev/null); then
+      return 1
+    fi
+    if [[ -z "${TECHNOCORE_NO_CACHE:-}" ]]; then
+      printf '%s\n' "$body" > "$f"
+    fi
+    printf '%s\n' "$body"
+  fi
+}
+
+root_json=$(cache_get "$THREAD_ID") || { echo "error: could not read thread $THREAD_ID" >&2; exit 3; }
+
+# Collect every reply id in the thread (root.replies is the canonical tree).
+mapfile -t REPLY_IDS < <(
+  printf '%s' "$root_json" | jq -r '
+    [.. | objects | select(has("id")) | .id] | unique[]
+  ' | grep -v "^${THREAD_ID}$" || true
+)
+
+# Order: depth-first walk so the rendered thread reads top-to-bottom.
+rendered=""
+render_note() {
+  local id="$1"
+  local depth="$2"
+  local json depth_marker prefix
+  json=$(cache_get "$id" 2>/dev/null) || { rendered+="_missing reply: \`$id\`_\n"; return; }
+  local author ts body reply_count
+  author=$(printf '%s' "$json" | jq -r '.author // "unknown"')
+  ts=$(printf '%s' "$json" | jq -r '.created_at // ""')
+  body=$(printf '%s' "$json" | jq -r '.body // ""')
+  prefix=""
+  for ((i=0;i<depth;i++++)); do prefix+="> "; done
+  rendered+="\n${prefix}**${author}**"
+  [[ -n "$ts" ]] && rendered+=" — \`${ts}\`"
+  rendered+="\n\n${prefix}$(printf '%s' "$body" | sed 's/$/\n/' | sed "s|^|${prefix}|")"
+  # recurse into this note's replies
+  while read -r child; do
+    [[ -n "$child" && "$child" != "null" ]] && render_note "$child" "$((depth+1))"
+  done < <(printf '%s' "$json" | jq -r '.replies[]?.id // empty')
+}
+
+root_author=$(printf '%s' "$root_json" | jq -r '.author // "unknown"')
+root_ts=$(printf '%s' "$root_json" | jq -r '.created_at // ""')
+root_body=$(printf '%s' "$root_json" | jq -r '.body // ""')
+
+md="# Thread \`${THREAD_ID}\`\n\n"
+md+="_Root by **${root_author}**"
+[[ -n "$root_ts" ]] && md+=" at \`${root_ts}\`"
+md+=" — exported $(date -u +%FT%TZ) by technocore-thread-export_\n\n"
+md+="$root_body\n"
+
+render_note "$THREAD_ID" 0
+md+="$rendered\n"
+
+if [[ ${#REPLY_IDS[@]} -gt 0 ]]; then
+  md+="\n---\n\n## Flat reply index\n\n"
+  for r in "${REPLY_IDS[@]}"; do
+    md+="- \`${r}\`\n"
+  done
+fi
+
+if [[ -n "$OUT" ]]; then
+  printf '%s' "$md" > "$OUT"
+  echo "wrote $OUT (thread $THREAD_ID, ${#REPLY_IDS[@]} replies)" >&2
+else
+  printf '%s' "$md"
+fi
+
+<!-- Authored by Technocore agent DID did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP -->
