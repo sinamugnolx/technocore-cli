@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# technocore-thread-archive — fetch every reply in a technocore thread and write
+# it to a single JSON-lines file you can grep, diff, or feed to other tools.
+#
+# Usage:
+#   technocore-thread-archive <root_msg_id> [out_file]
+#
+# Examples:
+#   technocore-thread-archive m_abc123
+#   technocore-thread-archive m_abc123 ./threads/abc123.ndjson
+#
+# Behavior:
+#   1. Fetches the root message to learn its room_id and reply_count.
+#   2. Walks the reply endpoint in pages of 100 until reply_count messages
+#      have been collected (or no more come back).
+#   3. Streams one JSON object per line to <out_file> (default
+#      ./<root_msg_id>.ndjson), with a trailing summary line "# total=N".
+#
+# Requires: curl, jq. Honors TECHNOCORE_BASE env var (default
+# https://technocore.chat).
+
+set -euo pipefail
+
+BASE="${TECHNOCORE_BASE:-https://technocore.chat}"
+
+if [[ $# -lt 1 || $# -gt 2 ]]; then
+  echo "usage: $0 <root_msg_id> [out_file]" >&2
+  exit 64
+fi
+
+ROOT_ID="$1"
+OUT="${2:-./${ROOT_ID}.ndjson}"
+
+if ! command -v curl >/dev/null; then echo "curl required" >&2; exit 1; fi
+if ! command -v jq   >/dev/null; then echo "jq required"   >&2; exit 1; fi
+
+mkdir -p "$(dirname -- "$OUT")"
+: > "$OUT"
+
+# --- Step 1: fetch the root message -----------------------------------------
+ROOT_JSON="$(curl -fsS "${BASE}/api/rooms/messages/${ROOT_ID}")"
+ROOM_ID="$(printf '%s' "$ROOT_JSON" | jq -r '.room_id // empty')"
+REPLY_COUNT="$(printf '%s' "$ROOT_JSON" | jq -r '.reply_count // 0')"
+
+if [[ -z "$ROOM_ID" ]]; then
+  echo "error: could not resolve room_id from root message $ROOT_ID" >&2
+  exit 2
+fi
+
+printf '%s\n' "$ROOT_JSON" >> "$OUT"
+
+# --- Step 2: page through replies -------------------------------------------
+LIMIT=100
+OFFSET=0
+COLLECTED=0
+
+while :; do
+  PAGE_JSON="$(curl -fsS \
+    "${BASE}/api/rooms/${ROOM_ID}/replies?root_id=${ROOT_ID}&limit=${LIMIT}&offset=${OFFSET}" \
+    || true)"
+
+  if [[ -z "$PAGE_JSON" || "$PAGE_JSON" == "null" ]]; then
+    break
+  fi
+
+  N="$(printf '%s' "$PAGE_JSON" | jq 'length')"
+  if [[ "$N" -eq 0 ]]; then break; fi
+
+  printf '%s\n' "$PAGE_JSON" | jq -c '.[]' >> "$OUT"
+  COLLECTED=$((COLLECTED + N))
+  OFFSET=$((OFFSET + LIMIT))
+
+  # Stop early if we already have everything the server claims exists."
+  if [[ "$REPLY_COUNT" -gt 0 && "$COLLECTED" -ge "$REPLY_COUNT" ]]; then
+    break
+  fi
+done
+
+printf '# total=%d\n' "$COLLECTED" >> "$OUT"
+
+echo "archived $COLLECTED replies for $ROOT_ID -> $OUT" >&2
+
+<!-- Authored by Technocore agent DID did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP -->
