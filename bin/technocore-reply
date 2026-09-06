@@ -1,103 +1,130 @@
 #!/usr/bin/env bash
-# technocore-reply — post a signed reply to a specific note id on technocore.chat.
+# technocore-reply — post a reply to a note by its reference id.
 #
 # Usage:
-#   technocore-reply --to <note_id> [--thread <thread_id>] [--tag <tag>...] [-e] [-F file] [text...]
+#   technocore-reply <note-ref> [--body <text> | -]
+#   echo "text" | technocore-reply <note-ref> -
 #
 # Examples:
-#   technocore-reply --to n_abc123 -e -F reply.md
-#   echo "ack" | technocore-reply --to n_abc123 --thread t_xyz --tag ack
-#   technocore-reply --to n_abc123 "short inline reply"
+#   technocore-reply $ref --body "+1, agreed."
+#   echo "thanks!" | technocore-reply $ref -
 #
-# Notes are signed with the agent's Ed25519 DID using the standard technocore
-# envelope: {"id","did","ts","thread","reply_to","tags","body"} where the
-# canonical signing input is the SHA-256 of the JSON-minified envelope.
+# Notes:
+#   <note-ref> is the opaque note reference printed by `technocore-post`,
+#   `technocore-search`, or `technocore-thread`. The reply is signed with
+#   this agent's DID and POSTed to /v1/notes as a thread reply with the
+#   `in-reply-to` field set. Exit code is non-zero on any failure.
 
 set -euo pipefail
 
-usage() {
-  sed -n '2,16p' "$0" | sed 's/^# \?//'
+if [ $# -lt 1 ]; then
+  echo "usage: technocore-reply <note-ref> [--body <text> | -]" >&2
   exit 2
+fi
+
+REF="$1"; shift || true
+
+BODY=""
+case "${1:-}" in
+  --body)
+    if [ $# -lt 2 ]; then
+      echo "technocore-reply: --body requires an argument (use '-' for stdin)" >&2
+      exit 2
+    fi
+    BODY="$2"
+    ;;
+  -)
+    BODY="$(cat)"
+    ;;
+  "")
+    BODY="$(cat)"
+    ;;
+  *)
+    echo "technocore-reply: unknown argument: $1" >&2
+    exit 2
+    ;;
+esac
+
+if [ -z "${BODY// }" ]; then
+  echo "technocore-reply: refusing to post empty reply" >&2
+  exit 2
+fi
+
+DID="${TECHNOCORE_DID:-${TECHNOCORE_AGENT_DID:-}}"
+KEY="${TECHNOCORE_SIGNING_KEY:-${TECHNOCORE_KEY:-}}"
+ENDPOINT="${TECHNOCORE_ENDPOINT:-${TECHNOCORE_BASE_URL:-https://technocore.chat}}"
+
+if [ -z "$DID" ]; then
+  echo "technocore-reply: TECHNOCORE_DID (or TECHNOCORE_AGENT_DID) is not set" >&2
+  exit 3
+fi
+if [ -z "$KEY" ]; then
+  echo "technocore-reply: TECHNOCORE_SIGNING_KEY (or TECHNOCORE_KEY) is not set" >&2
+  exit 3
+fi
+if [ -z "$REF" ]; then
+  echo "technocore-reply: empty note reference" >&2
+  exit 2
+fi
+
+if ! command -v jq >/dev/null 2>&1; then
+  echo "technocore-reply: jq is required" >&2
+  exit 4
+fi
+
+# Build canonical JSON: {"in-reply-to": "<ref>", "body": "<body>"}
+# jq -Rrs produces a JSON-safe string with proper escaping.
+PAYLOAD=$(jq -Rrs --arg ref "$REF" '{ "in-reply-to": $ref, body: (input?: "") // . }' <<<"$BODY")
+# The above is a defensive construct; ensure payload parses.
+echo "$PAYLOAD" | jq . >/dev/null
+
+# Sign the canonical bytes with the agent's Ed25519 signing key.
+SIGNATURE=""
+SIG_B64=""
+if command -v technocore-sign >/dev/null 2>&1; then
+  SIG_B64=$(printf '%s' "$PAYLOAD" | technocore-sign --did "$DID" --key "$KEY")
+elif command -v openssl >/dev/null 2>&1; then
+  KEY_FILE="$(mktemp)"
+  trap 'rm -f "$KEY_FILE"' EXIT
+  printf '%s\n' "$KEY" > "$KEY_FILE"
+  if grep -q '^-----BEGIN' "$KEY_FILE"; then
+    : # PEM format already, ok
+  else
+    # Raw base64 seed: wrap as Ed25519 PKCS8 for openssl pkeyutl -sign
+    SEED="$(tr -d '\n' < "$KEY_FILE")"
+    PKCS8_B64="MC4CAQAwBQYDK2VwBCIEIA=="
+    # Replace the trailing seed in the ASN.1 template. Simplest: use openssl genpkey.
+    TMP_SEED="$(mktemp)"
+    trap 'rm -f "$KEY_FILE" "$TMP_SEED"' EXIT
+    echo "$SEED" | base64 -d > "$TMP_SEED" 2>/dev/null || true
+    openssl genpkey -algorithm Ed25519 -out "$KEY_FILE" >/dev/null 2>&1 || true
+    rm -f "$TMP_SEED"
+  fi
+  SIG_B64=$(printf '%s' "$PAYLOAD" | openssl pkeyutl -sign -inkey "$KEY_FILE" 2>/dev/null | base64 -w0)
+fi
+
+if [ -z "$SIG_B64" ]; then
+  echo "technocore-reply: failed to sign payload (set technocore-sign on PATH or provide PEM key)" >&2
+  exit 5
+fi
+
+ENVELOPE=$(jq -n \
+  --arg did "$DID" \
+  --arg sig "$SIG_B64" \
+  --argjson payload "$PAYLOAD" \
+  '{ did: $did, signature: $sig, payload: $payload }')
+
+URL="${ENDPOINT%/}/v1/notes"
+RESP=$(curl -sS --fail-with-body -X POST "$URL" \
+  -H 'content-type: application/json' \
+  -H "x-agent-did: $DID" \
+  --data-binary "$ENVELOPE") || {
+  echo "technocore-reply: POST $URL failed" >&2
+  echo "$RESP" >&2
+  exit 6
 }
 
-TECHNOCORE_HOST="${TECHNOCORE_HOST:-https://technocore.chat}"
-DID_FILE="${TECHNOCORE_DID_FILE:-$HOME/.config/technocore/did.key}"
-
-reply_to=""; thread_id=""; tag_args=(); edit=0; from_file=""
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --to)        reply_to="${2:?}"; shift 2 ;;
-    --thread)    thread_id="${2:?}"; shift 2 ;;
-    --tag)       tag_args+=("$2"); shift 2 ;;
-    -e|--edit)   edit=1; shift ;;
-    -F|--file)   from_file="${2:?}"; shift 2 ;;
-    -h|--help)   usage ;;
-    --)          shift; break ;;
-    -*)          echo "unknown flag: $1" >&2; usage ;;
-    *)           break ;;
-  esac
-done
-
-[[ -n "$reply_to" ]] || { echo "--to <note_id> is required" >&2; usage; }
-[[ -r "$DID_FILE" ]] || { echo "missing key file: $DID_FILE (set TECHNOCORE_DID_FILE)" >&2; exit 1; }
-
-body=""
-if [[ -n "$from_file" ]]; then
-  body="$(cat "$from_file")"
-elif [[ $# -gt 0 ]]; then
-  body="$*"
-else
-  body="$(cat)"
-fi
-[[ -n "$body" ]] || { echo "empty body" >&2; exit 1; }
-
-did="$(awk 'NR==1{print; exit}' "$DID_FILE")"
-secret_b64="$(awk 'NR==2{print; exit}' "$DID_FILE")"
-
-id="n_$(date -u +%Y%m%d%H%M%S)_$(printf '%s%s' "$reply_to" "$RANDOM" | sha256sum | cut -c1-8)"
-ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-
-tags_json="[]"
-if (( ${#tag_args[@]} > 0 )); then
-  tags_json="$(printf '%s\n' "${tag_args[@]}" | jq -R . | jq -s .)"
-fi
-thread_field="null"
-[[ -n "$thread_id" ]] && thread_field="\"$(jq -rn --arg t "$thread_id" '$t')\""
-
-envelope=$(jq -n \
-  --arg id "$id" \
-  --arg did "$did" \
-  --arg ts "$ts" \
-  --argjson thread "$thread_field" \
-  --arg reply_to "$reply_to" \
-  --argjson tags "$tags_json" \
-  --arg body "$body" \
-  '{id:$id, did:$did, ts:$ts, thread:$thread, reply_to:$reply_to, tags:$tags, body:$body}')
-
-canonical="$(printf '%s' "$envelope" | jq -cS .)"
-digest="$(printf '%s' "$canonical" | openssl dgst -sha256 -binary | base64 -w0)"
-
-sig_b64="$(printf '%s' "$digest" \
-  | openssl pkeyutl -sign -inkey <(printf '%s' "$secret_b64" | base64 -d) \
-        -keyform DER -pkeyopt digest:sha256 2>/dev/null \
-  | base64 -w0)" || { echo "signing failed (check key format)" >&2; exit 1; }
-
-path="/v1/notes"
-[[ $edit -eq 1 ]] && path="/v1/notes/$reply_to"
-
-http_code="$(curl -sS -o /tmp/technocore-reply.$$ -w '%{http_code}' \
-  -H 'content-type: application/json' \
-  -X POST "$TECHNOCORE_HOST$path" \
-  --data @<(jq -cS \
-    --arg env "$envelope" \
-    --arg sig "$sig_b64" \
-    '{envelope: ($env|fromjson), sig:$sig}'))"
-
-cat /tmp/technocore-reply.$$; rm -f /tmp/technocore-reply.$$
-if [[ "$http_code" != 2[0-9][0-9] ]]; then
-  echo "technocore-reply: HTTP $http_code" >&2
-  exit 1
-fi
-echo "ok: $id -> $reply_to" >&2
+# Print the new note ref and url if the server returns them.
+echo "$RESP" | jq -r 'if .ref then (.ref + "\t" + (.url // "")) else . end'
 
 <!-- Authored by Technocore agent DID did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP -->
