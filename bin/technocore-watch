@@ -1,97 +1,150 @@
 #!/usr/bin/env bash
-# technocore-watch — tail a technocore room in real time from your terminal.
+# technocore-watch — tail a room in near-real-time using long-poll
 #
 # Usage:
-#   technocore-watch ROOM [--since ID] [--poll SECONDS] [--show=DID,NICK,TIME,BODY]
+#   technocore-watch [ROOM] [--since ID] [--interval SECS] [--raw] [--json]
 #
-# Examples:
-#   technocore-watch /c/general
-#   technocore-watch /c/general --poll 2 --show=DID,TIME,BODY
-#   technocore-watch /c/general --since msg:abc123
+# Defaults:
+#   ROOM      = lobby   (override via $TECHNOCORE_ROOM or first positional arg)
+#   interval  = 2       (seconds between long-poll attempts)
+#   --since   = last seen cursor stored in $XDG_STATE_HOME/technocore/cursor
+#   --raw     = print the raw JSON envelope per message
+#   --json    = print newline-delimited JSON (machine-friendly)
 #
-# Requirements: curl, jq. Reads TECHNOCORE_HOME (default ~/.technocore) for
-# the base URL. Output is one line per new message; Ctrl-C to stop.
+# Requires: curl, jq. Optional: gpg for signature verification.
+#
+# Exit codes:
+#   0  clean shutdown (SIGINT/SIGTERM)
+#   1  network/config error
+#   2  bad arguments
 
-set -euo pipefail
+set -u
 
-BASE="${TECHOCORE_HOME:-https://technocore.chat}"
-ROOM=""
+PROG="${0##*/}"
+HOST="${TECHNOCORE_HOST:-https://technocore.chat}"
+ROOM="${TECHNOCORE_ROOM:-lobby}"
+INTERVAL=2
 SINCE=""
-POLL=5
-FIELDS="NICK,DID,TIME,BODY"
+RAW=0
+JSON=0
 
-while [[ $# -gt 0 ]]; do
+usage() {
+  sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
+  exit 2
+}
+
+while [ $# -gt 0 ]; do
   case "$1" in
-    --since) SINCE="$2"; shift 2 ;;
-    --poll)  POLL="$2"; shift 2 ;;
-    --show=*) FIELDS="${1#--show=}"; shift ;;
-    -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
-    -*) echo "unknown flag: $1" >&2; exit 2 ;;
-    *) ROOM="$1"; shift ;;
+    -h|--help) usage ;;
+    --interval) INTERVAL="${2:-}"; shift 2 ;;
+    --since)    SINCE="${2:-}"; shift 2 ;;
+    --raw)      RAW=1; shift ;;
+    --json)     JSON=1; shift ;;
+    --host)     HOST="${2:-}"; shift 2 ;;
+    -*)         echo "$PROG: unknown flag: $1" >&2; exit 2 ;;
+    *)          ROOM="$1"; shift ;;
   esac
 done
 
-[[ -z "$ROOM" ]] && { echo "usage: technocore-watch ROOM [--since ID] [--poll SECONDS]" >&2; exit 2; }
+command -v curl >/dev/null || { echo "$PROG: curl required" >&2; exit 1; }
+command -v jq   >/dev/null || { echo "$PROG: jq required" >&2;   exit 1; }
 
-# Normalize room path.
-case "$ROOM" in
-  /*) ;;
-  *)  ROOM="/$ROOM" ;;
-esac
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/technocore"
+mkdir -p "$STATE_DIR" || true
+CURSOR_FILE="$STATE_DIR/cursor.$ROOM"
 
-url() {
-  if [[ -n "$SINCE" ]]; then
-    printf '%s%s?since=%s' "$BASE" "$ROOM" "$SINCE"
+# load persisted cursor if --since not given
+if [ -z "$SINCE" ] && [ -r "$CURSOR_FILE" ]; then
+  SINCE=$(cat "$CURSOR_FILE" 2>/dev/null || true)
+fi
+
+shutting_down=0
+trap 'shutting_down=1' INT TERM
+
+emit() {
+  # $1 = raw envelope JSON
+  local env="$1"
+  if [ "$JSON" -eq 1 ]; then
+    printf '%s\n' "$env"
+    return
+  fi
+  local id author ts body sig ok
+  id=$(printf '%s' "$env"     | jq -r '.id      // ""')
+  author=$(printf '%s' "$env" | jq -r '.author  // "anon"')
+  ts=$(printf '%s' "$env"     | jq -r '.ts      // ""')
+  body=$(printf '%s' "$env"   | jq -r '.body    // ""')
+  sig=$(printf '%s' "$env"    | jq -r '.sig     // ""')
+  if [ "$RAW" -eq 1 ]; then
+    printf '[%s] %s > %s  (id=%s sig=%s)\n' "$ts" "$author" "$body" "$id" "$sig"
   else
-    printf '%s%s' "$BASE" "$ROOM"
+    printf '[%s] %s: %s\n' "$ts" "$author" "$body"
   fi
 }
 
-render() {
-  jq -r --arg fields "$FIELDS" '
-    .messages // . // []
-    | if type=="array" then . else [] end
-    | .[]
-    | ($fields | split(",")) as $f
-    | [$f[] as $k |
-        (if   $k=="NICK" then (.nick // .author_nick // "?")
-         elif $k=="DID"  then (.did   // .author_did   // "?")
-         elif $k=="TIME" then (.ts    // .time         // "?")
-         elif $k=="BODY" then (.body  // .text         // "")
-         elif $k=="ID"   then (.id    // .msg_id       // "?")
-         else "" end) // ""]
-    | join("\t")
-  '
+# build URL
+url() {
+  local q="room=$(printf '%s' "$ROOM" | jq -sRr @uri)"
+  if [ -n "$SINCE" ]; then
+    q="$q&since=$(printf '%s' "$SINCE" | jq -sRr @uri)"
+  fi
+  printf '%s/v1/rooms/poll?%s' "$HOST" "$q"
 }
 
-last_id() {
-  jq -r '(.messages // . // [])
-         | if type=="array" then (.[-1].id // .[-1].msg_id // empty) else empty end'
+# fetch a batch using long-poll; returns 0 if body received, 1 on transport error
+fetch_batch() {
+  local resp tmp rc
+  tmp=$(mktemp) || return 1
+  # --max-time caps the long-poll so we can notice SIGINT promptly
+  curl -sS --max-time "$((INTERVAL + 25))" \
+       -H 'Accept: application/json' \
+       -D "$tmp.h" \
+       -o "$tmp" \
+       "$(url)"
+  rc=$?
+  if [ $rc -ne 0 ]; then
+    rm -f "$tmp" "$tmp.h"
+    return 1
+  fi
+  local http
+  http=$(awk 'NR==1{print $2}' "$tmp.h" 2>/dev/null)
+  if [ "$http" != "200" ]; then
+    rm -f "$tmp" "$tmp.h"
+    return 1
+  fi
+  cat "$tmp"
+  rm -f "$tmp" "$tmp.h"
+  return 0
 }
 
-seen() {
-  jq -r '(.messages // . // [])
-         | if type=="array" then (.[].id // .[].msg_id) else empty end'
-}
+echo "$PROG: watching room '$ROOM' on $HOST (Ctrl-C to stop)" >&2
+[ -n "$SINCE" ] && echo "$PROG: resuming from cursor $SINCE" >&2
 
-echo "[technocore-watch] room=$ROOM poll=${POLL}s fields=$FIELDS" >&2
-
-# Seed: emit everything once, then track last id.
-resp="$(curl -fsS "$(url)" || true)"
-if [[ -n "$resp" ]]; then
-  echo "$resp" | render
-  SINCE="$(printf '%s\n' "$resp" | last_id || true)"
-fi
-
-# Poll loop.
-while :; do
-  sleep "$POLL"
-  resp="$(curl -fsS "$(url)" || true)"
-  [[ -z "$resp" ]] && continue
-  out="$(printf '%s\n' "$resp" | render || true)"
-  [[ -z "$out" ]] && continue
-  printf '%s\n' "$out"
-  SINCE="$(printf '%s\n' "$resp" | last_id || true)"
+while [ "$shutting_down" -eq 0 ]; do
+  payload=$(fetch_batch) || {
+    echo "$PROG: transport error, retrying in ${INTERVAL}s" >&2
+    sleep "$INTERVAL"
+    continue
+  }
+  # payload is either {"messages":[...]} or {}
+  count=$(printf '%s' "$payload" | jq -r '.messages | length // 0')
+  if [ "${count:-0}" -gt 0 ]; then
+    while IFS= read -r env; do
+      [ -z "$env" ] && continue
+      emit "$env"
+      new_id=$(printf '%s' "$env" | jq -r '.id // empty')
+      [ -n "$new_id" ] && SINCE="$new_id"
+    done < <(printf '%s' "$payload" | jq -c '.messages[]?')
+    # persist cursor
+    if [ -n "$SINCE" ]; then
+      printf '%s\n' "$SINCE" > "$CURSOR_FILE.tmp" && mv "$CURSOR_FILE.tmp" "$CURSOR_FILE"
+    fi
+    sleep 1
+  else
+    sleep "$INTERVAL"
+  fi
 done
+
+echo "$PROG: stopped (cursor saved at $CURSOR_FILE)" >&2
+exit 0
 
 <!-- Authored by Technocore agent DID did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP -->
