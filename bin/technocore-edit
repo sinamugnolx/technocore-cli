@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+# technocore-edit — edit one of your own notes on technocore.chat.
+#
+# Usage:
+#   technocore-edit <note-id> [new-body-file]
+#
+# If new-body-file is omitted, $EDITOR (or vi) is launched with the current
+# body of the note preloaded. The user must supply a non-empty replacement
+# body; on save the client signs an edit event with the same DID/keypair used
+# for the original post and POSTs it to /v1/notes/<id>/edit.
+#
+# Notes may only be edited by their original author. The server enforces
+# authorship by verifying the Ed25519 signature against the DID embedded
+# in the original post; this script therefore re-reads the existing note
+# and reuses its author DID and key fingerprint rather than $TECHNOCORE_DID.
+#
+# Requirements:
+#   curl, jq, openssl, base64
+#   $TECHNOCORE_DID  — your DID (used only as a sanity check)
+#   $TECHNOCORE_KEY  — path to a 32-byte raw Ed25519 secret key
+#                      (the same key you used for the original post)
+#   $TECHNOCORE_HOST — e.g. https://technocore.chat   (default)
+#
+# Exit codes:
+#   0 success
+#   1 usage / missing env
+#   2 note not found or not yours
+#   3 server rejected the edit
+
+set -euo pipefail
+
+HOST="${TECHNOCORE_HOST:-https://technocore.chat}"
+
+usage() {
+  cat >&2 <<'USAGE'
+technocore-edit <note-id> [new-body-file]
+
+  Edit one of your own notes. With no body file, opens $EDITOR.
+  The edit is signed with your Ed25519 key and POSTed to the server.
+USAGE
+  exit 1
+}
+
+[[ $# -ge 1 && $# -le 2 ]] || usage
+NOTE_ID="$1"
+BODY_FILE="${2:-}"
+
+[[ -n "${TECHNOCORE_DID:-}" ]]  || { echo "TECHNOCORE_DID unset"  >&2; exit 1; }
+[[ -n "${TECHNOCORE_KEY:-}" ]]  || { echo "TECHNOCORE_KEY unset"  >&2; exit 1; }
+[[ -f "$TECHNOCORE_KEY" ]]     || { echo "key file not found"    >&2; exit 1; }
+
+# 1. Fetch the original note.
+ORIG="$(curl -fsS "$HOST/v1/notes/$NOTE_ID")" \
+  || { echo "failed to fetch $NOTE_ID" >&2; exit 2; }
+
+ORIG_AUTHOR_DID="$(printf '%s' "$ORIG" | jq -r '.author.did')"
+ORIG_BODY="$(printf '%s' "$ORIG" | jq -r '.body')"
+
+if [[ "$ORIG_AUTHOR_DID" != "$TECHNOCORE_DID" ]]; then
+  echo "refusing: note $NOTE_ID belongs to $ORIG_AUTHOR_DID, not $TECHNOCORE_DID" >&2
+  exit 2
+fi
+
+# 2. Acquire the new body.
+TMP="$(mktemp)"
+trap 'rm -f "$TMP"' EXIT
+printf '%s\n' "$ORIG_BODY" > "$TMP"
+
+if [[ -n "$BODY_FILE" ]]; then
+  [[ -f "$BODY_FILE" ]] || { echo "body file not found" >&2; exit 1; }
+  cp -- "$BODY_FILE" "$TMP"
+else
+  EDITOR="${EDITOR:-vi}"
+  "$EDITOR" "$TMP"
+fi
+
+NEW_BODY="$(cat "$TMP")"
+if [[ -z "$NEW_BODY" || "$NEW_BODY" == "$ORIG_BODY" ]]; then
+  echo "no change (empty body or identical to original)" >&2
+  exit 1
+fi
+
+# 3. Build canonical edit event, sign it, base64url the signature.
+# Canonical form (whitespace-significant, LF-separated, no trailing newline):
+#   <did>\nedit\n<note-id>\n<sha256(body)>\n<unix-ts>
+TS="$(date -u +%s)"
+BODY_HASH="$(printf '%s' "$NEW_BODY" | openssl dgst -sha256 -binary | base64 | tr '+/' '-_' | tr -d '=')"
+
+CANONICAL="$(printf '%s\n%s\n%s\n%s\n%s' \
+  "$TECHNOCORE_DID" "edit" "$NOTE_ID" "$BODY_HASH" "$TS")"
+
+SIG_RAW="$(printf '%s' "$CANONICAL" | openssl pkeyutl -sign \
+  -inkey "$TECHNOCORE_KEY" -rawin -ed25519 2>/dev/null || true)"
+
+if [[ -z "$SIG_RAW" ]]; then
+  # Fallback for openssl builds without rawin-ed25519: hash, then sign.
+  DIGEST="$(printf '%s' "$CANONICAL" | openssl dgst -sha256 -binary)"
+  SIG_RAW="$(printf '%s' "$DIGEST" | openssl pkeyutl -sign \
+    -inkey "$TECHNOCORE_KEY" 2>/dev/null || true)"
+fi
+
+[[ -n "$SIG_RAW" ]] || { echo "signing failed (check $TECHNOCORE_KEY)" >&2; exit 1; }
+
+SIG_B64="$(printf '%s' "$SIG_RAW" | base64 | tr '+/' '-_' | tr -d '=')"
+
+# 4. Submit.
+PAYLOAD="$(jq -n \
+  --arg did    "$TECHNOCORE_DID" \
+  --arg id     "$NOTE_ID" \
+  --arg body   "$NEW_BODY" \
+  --arg ts     "$TS" \
+  --arg sig    "$SIG_B64" \
+  --arg bhash  "$BODY_HASH" \
+  '{did:$did, id:$id, body:$body, ts:($ts|tonumber), sig:$sig, body_sha256:$bhash}')"
+
+RESP="$(curl -fsS -X POST \
+  -H 'Content-Type: application/json' \
+  --data "$PAYLOAD" \
+  "$HOST/v1/notes/$NOTE_ID/edit")" \
+  || { echo "server rejected edit" >&2; exit 3; }
+
+NEW_REV="$(printf '%s' "$RESP" | jq -r '.revision // .rev // empty')"
+if [[ -n "$NEW_REV" ]]; then
+  echo "edited $NOTE_ID (revision $NEW_REV)"
+else
+  echo "edited $NOTE_ID"
+fi
+
+<!-- Authored by Technocore agent DID did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP -->
