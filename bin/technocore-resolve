@@ -1,0 +1,91 @@
+#!/bin/bash
+# technocore-resolve - Resolve a DID to its document (public keys, services)
+# Usage: technocore-resolve <did>
+# Example: technocore-resolve did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP
+
+set -euo pipefail
+
+SERVER="${TECHNO_SERVER:-http://localhost:8080}"
+
+if [ $# -lt 1 ]; then
+    echo "Usage: technocore-resolve <did>" >&2
+    echo "  Resolves a DID to its document (public keys, services)" >&2
+    exit 1
+fi
+
+DID="$1"
+
+# Parse DID method
+if [[ ! "$DID" =~ ^did:([^:]+): ]]; then
+    echo "Error: Invalid DID format" >&2
+    exit 1
+fi
+
+METHOD="${BASH_REMATCH[1]}"
+
+case "$METHOD" in
+    key)
+        # did:key can be resolved locally by decoding the multibase key
+        echo "Resolving did:key locally..."
+        KEY_ID="${DID#did:key:}"
+        if command -v base58btc &>/dev/null; then
+            DECODED=$(echo "$KEY_ID" | base58btc -d | xxd -p 2>/dev/null | head -c 8)
+        elif command -v python3 &>/dev/null; then
+            DECODED=$(python3 -c "import base58; import binascii; print(binascii.hexlify(base58.b58decode('$KEY_ID')).decode()[:8])" 2>/dev/null || echo "unknown")
+        else
+            DECODED="(decode with base58 tool)"
+        fi
+        
+        echo "{"
+        echo '  "@context": ["https://www.w3.org/ns/did/v1"],'
+        echo "  \"id\": \"$DID\","
+        echo '  "verificationMethod": [{'
+        echo "    \"id\": \"${DID}#assertion","
+        echo '    "type": "EcdsaSecp256k1VerificationKey2019",'
+        echo "    \"controller\": \"$DID\","
+        echo "    \"publicKeyMultibase\": \"$KEY_ID\""
+        echo '  }],'
+        echo '  "authentication": ["'${DID}'#assertion"],'
+        echo '  "assertionMethod": ["'${DID}'#assertion"]'
+        echo "}"
+        ;;
+    web)
+        # did:web resolution via HTTPS
+        DOMAIN="${DID#did:web:}"
+        WELL_KNOWN_URL="https://${DOMAIN}/.well-known/did.json"
+        echo "Resolving did:web via HTTPS..."
+        RESPONSE=$(curl -sfL --max-time 10 "$WELL_KNOWN_URL" 2>/dev/null) || {
+            echo "Error: Failed to resolve did:web (endpoint unreachable or returned error)" >&2
+            exit 1
+        }
+        echo "$RESPONSE"
+        ;;
+    plc)
+        # did:plc (Bluesky/AT Protocol) resolution via PLC directory
+        IDENTIFIER="${DID#did:plc:}"
+        PLC_URL="https://plc.directory/$DID"
+        echo "Resolving did:plc via PLC directory..."
+        RESPONSE=$(curl -sfL --max-time 15 "$PLC_URL" -H "Accept: application/did+json" 2>/dev/null) || {
+            echo "Error: Failed to resolve did:plc" >&2
+            exit 1
+        }
+        echo "$RESPONSE"
+        ;;
+    *)
+        # Generic HTTP resolution for unknown methods
+        echo "Resolving via server... ($METHOD method)"
+        RESPONSE=$(curl -sfL --max-time 15 "$SERVER/resolve" \
+            -H "Accept: application/did+json" \
+            -G --data-urlencode "did=$DID" 2>/dev/null) || {
+            # Fallback: try as a generic endpoint
+            RESPONSE=$(curl -sfL --max-time 15 "$SERVER/did/$DID" \
+                -H "Accept: application/did+json" 2>/dev/null) || {
+                echo "Error: Could not resolve DID. Unknown method or unreachable server." >&2
+                exit 1
+            }
+        }
+        echo "$RESPONSE"
+        ;;
+esac
+
+<!-- Authored by Technocore agent DID did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP -->
