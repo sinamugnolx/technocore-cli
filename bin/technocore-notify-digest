@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# technocore-notify-digest -- summarize unread reply notifications into a digest.
+#
+# Reads the JSON Lines log produced by `technocore-reply-notify` (one event per
+# notification, append-only) and prints a digest grouped by thread. The log
+# path defaults to ~/.local/share/technocore/reply-notify.log but can be
+# overridden with TECHNOCORE_NOTIFY_LOG. A "since" filter (default: last 24h)
+# can be passed as the first argument; pass "all" to disable the window.
+#
+# Output is human-readable plain text and is safe to pipe into mail, IRC, or
+# any other agent transport. Designed to be cron-friendly.
+#
+# Usage:
+#   technocore-notify-digest                 # last 24h
+#   technocore-notify-digest 6h              # last 6 hours
+#   technocore-notify-digest all             # everything on record
+#   TECHNOCORE_NOTIFY_LOG=/tmp/notify.log technocore-notify-digest
+#
+# Exit codes: 0 on success, 1 if the log is missing/unreadable, 2 if no
+# notifications fall inside the requested window.
+
+set -euo pipefail
+
+LOG="${TECHNOCORE_NOTIFY_LOG:-$HOME/.local/share/technocore/reply-notify.log}"
+WINDOW="${1:-24h}"
+
+if [[ ! -r "$LOG" ]]; then
+  echo "technocore-notify-digest: cannot read $LOG" >&2
+  exit 1
+fi
+
+now_epoch=$(date -u +%s)
+
+case "$WINDOW" in
+  all) min_epoch=0 ;;
+  *h)  min_epoch=$(( now_epoch - ${WINDOW%h} * 3600 )) ;;
+  *m)  min_epoch=$(( now_epoch - ${WINDOW%m} * 60 )) ;;
+  *d)  min_epoch=$(( now_epoch - ${WINDOW%d} * 86400 )) ;;
+  *)   echo "technocore-notify-digest: bad window '$WINDOW' (use Nh, Nm, Nd, or all)" >&2 ; exit 1 ;;
+esac
+
+tmp=$(mktemp -t technocore-digest.XXXXXX)
+trap 'rm -f "$tmp"' EXIT
+
+# Filter the JSONL log to the time window. Each line is expected to be a
+# single JSON object with at least: ts (ISO-8601 UTC), room, thread, from,
+# preview. Missing/malformed lines are skipped silently.
+awk -v min="$min_epoch" '
+  function iso2epoch(s,    Y,M,D,h,m,z2,sec) {
+    if (s !~ /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}/) return -1
+    Y=substr(s,1,4); M=substr(s,6,2); D=substr(s,9,2)
+    h=substr(s,12,2); m=substr(s,15,2); sec=substr(s,18,2)
+    z2=substr(s,20,6)
+    cmd="date -u -d \"" Y "-" M "-" D " " h ":" m ":" sec " " z2 "\" +%s"
+    cmd | getline t; close(cmd); return t+0
+  }
+  {
+    line=$0
+    ts=""; room=""; thread=""; from=""; preview=""
+    n=split(line,a,",")
+    for (i=1;i<=n;i++) {
+      kv=a[i]; sub(/^[ "]*/,"",kv); sub(/[ "]*$/,"",kv)
+      split(kv,b,":"); k=b[1]; v=b[2]
+      sub(/^[ "]*/,"",k); sub(/[ "]*$/,"",k)
+      sub(/^[ "]*/,"",v); sub(/[ "]*$/,"",v)
+      if (k=="ts") ts=v
+      else if (k=="room") room=v
+      else if (k=="thread") thread=v
+      else if (k=="from") from=v
+      else if (k=="preview") preview=v
+    }
+    if (ts=="") next
+    e=iso2epoch(ts); if (e<min) next
+    printf "%s\t%s\t%s\t%s\t%s\n", room, thread, ts, from, preview
+  }
+' "$LOG" > "$tmp"
+
+count=$(wc -l < "$tmp" | tr -d ' ')
+if [[ "$count" == "0" ]]; then
+  echo "technocore-notify-digest: no notifications in the last $WINDOW"
+  exit 2
+fi
+
+echo "technocore reply digest -- last $WINDOW ($count notifications, generated $(date -u +%FT%TZ))"
+echo "----------------------------------------------------------------"
+
+current_thread=""
+current_count=0
+
+flush_thread() {
+  if [[ -n "$current_thread" ]]; then
+    echo "  ($current_count mention"$([[ $current_count -ne 1 ]] && echo s)")"
+    echo
+  fi
+}
+
+while IFS=$'\t' read -r room thread ts from preview; do
+  key="$room::$thread"
+  if [[ "$key" != "$current_thread" ]]; then
+    flush_thread
+    current_thread="$key"
+    current_count=0
+    echo "Thread: $thread"
+    echo "  room:   $room"
+  fi
+  current_count=$((current_count + 1))
+  preview="${preview:0:120}"
+  echo "  - [$ts] $from: $preview"
+done < "$tmp" | sort -k1,1 -k2,2
+
+flush_thread
+
+<!-- Authored by Technocore agent DID did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP -->
