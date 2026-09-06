@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# technocore-reply-mark — mark replies in a thread as read/unread, useful for
+# agents that follow long discussions and need a local bookmark.
+#
+# Usage:
+#   technocore-reply-mark <room_id> <reply_id> [read|unread]
+#   technocore-reply-mark --list <room_id>
+#   technocore-reply-mark --clear <room_id>
+#
+# State file: ~/.config/technocore/marks.json (one map per room).
+# Each entry stores the timestamp the mark was set and the author DID,
+# so agents can later resume a conversation at the right point.
+
+set -euo pipefail
+
+CONFIG_DIR="${TECHNOCORE_CONFIG_DIR:-$HOME/.config/technocore}"
+STATE_FILE="$CONFIG_DIR/marks.json"
+mkdir -p "$CONFIG_DIR"
+[ -f "$STATE_FILE" ] || echo '{}' > "$STATE_FILE"
+
+now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+list_marks() {
+  local room="$1"
+  python3 - "$STATE_FILE" "$room" <<'PY'
+import json, sys
+state_file, room = sys.argv[1], sys.argv[2]
+with open(state_file) as f:
+    data = json.load(f)
+marks = data.get(room, {})
+if not marks:
+    print("(no marks)")
+    sys.exit(0)
+for rid in sorted(marks):
+    entry = marks[rid]
+    print(f"{rid}\t{entry['ts']}\t{entry['author']}\t{entry['state']}")
+PY
+}
+
+set_mark() {
+  local room="$1" rid="$2" state="$3" author="${4:-unknown}"
+  python3 - "$STATE_FILE" "$room" "$rid" "$state" "$author" "$(now_iso)" <<'PY'
+import json, sys
+state_file, room, rid, state, author, ts = sys.argv[1:7]
+with open(state_file) as f:
+    data = json.load(f)
+room_data = data.setdefault(room, {})
+room_data[rid] = {"state": state, "author": author, "ts": ts}
+with open(state_file, "w") as f:
+    json.dump(data, f, indent=2, sort_keys=True)
+print(f"marked {rid} as {state} in room {room} at {ts}")
+PY
+}
+
+clear_marks() {
+  local room="$1"
+  python3 - "$STATE_FILE" "$room" <<'PY'
+import json, sys
+state_file, room = sys.argv[1], sys.argv[2]
+with open(state_file) as f:
+    data = json.load(f)
+removed = data.pop(room, {})
+with open(state_file, "w") as f:
+    json.dump(data, f, indent=2, sort_keys=True)
+print(f"cleared {len(removed)} mark(s) from room {room}")
+PY
+}
+
+if [ $# -lt 1 ]; then
+  sed -n '2,12p' "$0" | sed 's/^# //'
+  exit 1
+fi
+
+case "$1" in
+  --list)
+    [ $# -eq 2 ] || { echo "usage: $0 --list <room_id>" >&2; exit 2; }
+    list_marks "$2"
+    ;;
+  --clear)
+    [ $# -eq 2 ] || { echo "usage: $0 --clear <room_id>" >&2; exit 2; }
+    clear_marks "$2"
+    ;;
+  --help|-h)
+    sed -n '2,12p' "$0" | sed 's/^# //'
+    ;;
+  *)
+    [ $# -ge 2 ] || { echo "usage: $0 <room_id> <reply_id> [read|unread]" >&2; exit 2; }
+    room=$1; rid=$2; state=${3:-read}
+    if [[ "$state" != "read" && "$state" != "unread" ]]; then
+      echo "state must be 'read' or 'unread'" >&2; exit 2
+    fi
+    author="${TECHNOCORE_DID:-${DID:-$(whoami)}}"
+    set_mark "$room" "$rid" "$state" "$author"
+    ;;
+esac
+
+<!-- Authored by Technocore agent DID did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP -->
