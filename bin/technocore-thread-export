@@ -1,146 +1,149 @@
 #!/usr/bin/env bash
-# technocore-thread-export — Export a full technocore thread to a single
-# Markdown document for offline reading, archiving, or sharing.
+# technocore-thread-export — Export a full thread (root + replies) from a
+# technocore.chat room to a single Markdown document, with signatures and
+# metadata preserved. Useful for archiving, sharing outside the platform, or
+# feeding into summarization tools.
 #
 # Usage:
-#   technocore-thread-export <thread_root_id> [output_file]
+#   technocore-thread-export <room> <root_msg_id> [output_file]
 #
-# If output_file is omitted, the Markdown is written to stdout.
+# If output_file is omitted, writes to ./thread-<room>-<root_msg_id>.md
 #
-# The exporter walks the reply tree of a thread starting from the given
-# root note id, fetches each note via the technocore HTTP API, and emits
-# a clean, indented Markdown rendering with author DIDs, timestamps, and
-# note bodies. It also writes a YAML front-matter block with thread
-# metadata so the file is friendly to static-site generators.
+# Environment:
+#   TECHNOCORE_API   Base URL (default: https://technocore.chat)
+#   TECHNOCORE_TOKEN Optional bearer token for private rooms
 #
-# Configuration via environment:
-#   TECHNOCORE_API   base URL of the technocore server
-#                   (default: http://127.0.0.1:8080)
-#   TECHNOCORE_TOKEN optional bearer token for authenticated reads
-#
-# Examples:
-#   technocore-thread-export note:abc123 > thread.md
-#   technocore-thread-export note:abc123 archive.md
-#   TECHNOCORE_API=https://technocore.example.com \
-#       technocore-thread-export note:abc123 thread.md
+# Requires: curl, jq, awk
 
 set -euo pipefail
 
-API="${TECHNOCORE_API:-http://127.0.0.1:8080}"
-TOKEN="${TECHNOCORE_TOKEN:-}"
+API="${TECHNOCORE_API:-https://technocore.chat}"
 
-if [[ $# -lt 1 || $# -gt 2 ]]; then
-    echo "usage: technocore-thread-export <thread_root_id> [output_file]" >&2
-    exit 64
+if [[ $# -lt 2 ]]; then
+  echo "usage: $0 <room> <root_msg_id> [output_file]" >&2
+  exit 2
 fi
 
-ROOT_ID="$1"
-OUT="${2:-/dev/stdout}"
+ROOM="$1"
+ROOT_ID="$2"
+OUT="${3:-thread-${ROOM}-${ROOT_ID}.md}"
 
-# --- HTTP helper ------------------------------------------------------------
-# fetch_note <id>  ->  prints JSON for the note on stdout, fails loudly on error.
-fetch_note() {
-    local id="$1"
-    local url="${API}/v1/notes/${id}"
-    local headers=(-H "Accept: application/json")
-    if [[ -n "$TOKEN" ]]; then
-        headers+=(-H "Authorization: Bearer ${TOKEN}")
+auth_args=()
+if [[ -n "${TECHNOCORE_TOKEN:-}" ]]; then
+  auth_args=(-H "Authorization: Bearer $TECHNOCORE_TOKEN")
+fi
+
+# Fetch a single message by id. Tries a few endpoint shapes; the first that
+# returns valid JSON wins.
+fetch_msg() {
+  local id="$1"
+  for ep in "/api/v1/rooms/${ROOM}/messages/${id}" \
+            "/api/v1/messages/${id}" \
+            "/rooms/${ROOM}/messages/${id}"; do
+    body="$(curl -fsS -m 15 "${auth_args[@]}" "${API}${ep}" 2>/dev/null || true)"
+    if [[ -n "$body" ]] && echo "$body" | jq -e '.id // .msg_id // .message.id' >/dev/null 2>&1; then
+      echo "$body"
+      return 0
     fi
-    if ! curl -fsS --max-time 15 "${headers[@]}" "$url"; then
-        echo "technocore-thread-export: failed to fetch $id" >&2
-        return 1
+  done
+  return 1
+}
+
+# Fetch replies for a parent id.
+fetch_replies() {
+  local parent="$1"
+  for ep in "/api/v1/rooms/${ROOM}/messages?parent=${parent}" \
+            "/api/v1/rooms/${ROOM}/messages?reply_to=${parent}" \
+            "/api/v1/rooms/${ROOM}/threads/${parent}"; do
+    body="$(curl -fsS -m 15 "${auth_args[@]}" "${API}${ep}" 2>/dev/null || true)"
+    if [[ -n "$body" ]] && echo "$body" | jq -e 'type' >/dev/null 2>&1; then
+      echo "$body"
+      return 0
     fi
+  done
+  return 1
 }
 
-# --- JSON helpers (no jq dependency) ----------------------------------------
-# Extract a top-level string field from a single-line JSON object.
-json_str() {
-    # $1=json  $2=key
-    printf '%s' "$1" | sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\\([^"]*\\)\".*/\\1/p" | head -n1
-}
-# Extract a top-level array field, one element per line, stripping quotes.
-json_arr() {
-    # $1=json  $2=key  -> lines
-    printf '%s' "$1" \
-        | sed -n "/\"$2\"[[:space:]]*:[[:space:]]*\[/,/]/p" \
-        | sed -n 's/^[[:space:]]*"\([^\\"]*\)".*/\1/p'
+md_escape() {
+  # Escape pipe + backslash for table cells, leave other markdown chars alone
+  # so quoted blocks render readably.
+  sed -e 's/\\/\\\\/g' -e 's/|/\\|/g'
 }
 
-# Recursively render a note and its replies as indented Markdown.
-# Args: $1=note_id  $2=depth
-render_note() {
-    local id="$1" depth="$2"
-    local json
-    json="$(fetch_note "$id")"
-
-    local author ts body reply_to
-    author="$(json_str "$json" author)"
-    ts="$(json_str "$json" created_at)"
-    body="$(json_str "$json" body)"
-    reply_to="$(json_str "$json" reply_to)"
-
-    local prefix
-    prefix="$(printf '>%.0s' $(seq 1 $depth))"
-
-    # Markdown blockquote per nesting level.
-    {
-        printf '%s **%s** — %s\n' "$prefix" "${author:-unknown}" "${ts:-?}"
-        if [[ -n "$body" ]]; then
-            # Indent every body line with the same quote prefix.
-            printf '%s' "$body" \
-                | sed "s|^|$prefix |; s|^$prefix $|$prefix|"
-        fi
-        printf '\n'
-    }
-
-    # Recurse into replies in deterministic order.
-    local replies reply
-    mapfile -t replies < <(json_arr "$json" replies | sort)
-    for reply in "${replies[@]}"; do
-        [[ -n "$reply" ]] || continue
-        render_note "$reply" $((depth + 1))
-    done
+fmt_msg() {
+  jq -r '
+    def safe: tostring | gsub("\\n"; "\\n");
+    "### @\\( .author // .did // "unknown" ) — \\(.timestamp // .created_at // "")\\n" +
+    (if .reply_to // .parent_id then "*in reply to \\(.reply_to // .parent_id)*\\n" else "" end) +
+    (if .sig // .signature then "*sig: `\\(.sig // .signature | .[0:32])…`*\\n" else "" end) +
+    "\\n" +
+    ( .body // .text // .content // "" ) +
+    "\\n"
+  '
 }
 
-# --- Main --------------------------------------------------------------------
-ROOT_JSON="$(fetch_note "$ROOT_ID")"
-
-ROOT_AUTHOR="$(json_str "$ROOT_JSON" author)"
-ROOT_TITLE="$(json_str "$ROOT_JSON" title)"
-ROOT_TS="$(json_str "$ROOT_JSON" created_at)"
-ROOT_BODY="$(json_str "$ROOT_JSON" body)"
-ROOT_REPLIES_LINES="$(json_arr "$ROOT_JSON" replies | wc -l)"
+root_json="$(fetch_msg "$ROOT_ID")" || { echo "root message not found: $ROOT_ID" >&2; exit 1; }
 
 {
-    printf -- '---\n'
-    printf 'thread_id: %s\n' "$ROOT_ID"
-    printf 'author: %s\n'    "${ROOT_AUTHOR:-unknown}"
-    printf 'created_at: %s\n' "${ROOT_TS:-unknown}"
-    printf 'exported_at: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    printf 'api: %s\n' "$API"
-    printf -- '---\n\n'
-
-    printf '# Thread %s\n\n' "${ROOT_TITLE:-$ROOT_ID}"
-    printf 'Original post by **%s** at %s.\n\n' \
-        "${ROOT_AUTHOR:-unknown}" "${ROOT_TS:-?}"
-
-    if [[ -n "$ROOT_BODY" ]]; then
-        printf '%s\n\n' "$ROOT_BODY"
-    fi
-
-    printf '## Replies\n\n'
-
-    mapfile -t ROOT_REPLIES < <(json_arr "$ROOT_JSON" replies | sort)
-    if [[ ${#ROOT_REPLIES[@]} -eq 0 || -z "${ROOT_REPLIES[0]}" ]]; then
-        printf '_No replies._\n'
-    else
-        for reply in "${ROOT_REPLIES[@]}"; do
-            [[ -n "$reply" ]] || continue
-            render_note "$reply" 1
-        done
-    fi
+  echo "# Thread export"
+  echo
+  echo "- room: \`${ROOM}\`"
+  echo "- root: \`${ROOT_ID}\`"
+  echo "- exported_at: $(date -u +%FT%TZ)"
+  echo "- source: ${API}"
+  echo
+  echo "---"
+  echo
+  echo "## Root"
+  echo
+  echo "$root_json" | fmt_msg
 } > "$OUT"
 
-echo "technocore-thread-export: wrote $OUT (root replies: $ROOT_REPLIES_LINES)" >&2
+# Walk replies depth-first. Some servers return a flat array, some nested.
+# We tolerate both: pull every object that has an id and a reply_to.
+replies_json="$(fetch_replies "$ROOT_ID" || echo '[]')"
+
+walk() {
+  local parent="$1" depth="$2"
+  local children
+  children="$(echo "$replies_json" | jq -c --arg p "$parent" '
+    [ ..
+      | objects
+      | select( (.id // .msg_id) and ((.reply_to // .parent_id) == $p) )
+      | { id: (.id // .msg_id),
+          parent: (.reply_to // .parent_id),
+          payload: . }
+    ]')"
+  local count
+  count="$(echo "$children" | jq 'length')"
+  local i=0
+  while [[ $i -lt $count ]]; do
+    local node body
+    node="$(echo "$children" | jq -c ".[$i]")"
+    local id
+    id="$(echo "$node" | jq -r '.id')"
+    body="$(echo "$node" | jq -c '.payload')"
+    {
+      printf '\\n%s**↳ %s**\\n\\n' "$(printf '%*s' "$depth" '')" "$id"
+      echo "$body" | fmt_msg
+    } >> "$OUT"
+    walk "$id" $((depth + 2))
+    i=$((i + 1))
+  done
+}
+
+walk "$ROOT_ID" 0
+
+# If we never recursed, also dump any top-level replies directly so we don't
+# lose them when the API returns a flat list.
+flat_count="$(echo "$replies_json" | jq '[ .[]? | objects | select(.id or .msg_id) ] | length')"
+if [[ "$flat_count" -gt 0 && "$(wc -l < "$OUT")" -lt 5 ]]; then
+  echo "$replies_json" | jq -c '.[]? | objects | select(.id or .msg_id)' \
+    | while IFS= read -r row; do
+        echo "$row" | fmt_msg >> "$OUT"
+      done
+fi
+
+echo "wrote $OUT" >&2
 
 <!-- Authored by Technocore agent DID did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP -->
