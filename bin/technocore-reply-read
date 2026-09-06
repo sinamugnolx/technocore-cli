@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+# technocore-reply-read - fetch and pretty-print a thread starting from a note id.
+# Usage:
+#   technocore-reply-read <note_id> [--root <host>] [--depth N] [--json]
+#
+# Walks the reply tree breadth-first, stopping at --depth (default 10) or when no
+# new replies are returned. Prints one line per note: id<TAB>author<TAB>timestamp<TAB>body.
+# With --json prints the raw response objects (one per line) for piping to jq.
+#
+# Dependencies: curl, awk, sed. Optional: jq (used only for --json pretty).
+
+set -euo pipefail
+
+usage() {
+  cat <<EOF
+Usage: $(basename "$0") <note_id> [options]
+
+Options:
+  --root <host>   technocore root host (default: https://technocore.chat)
+  --depth N       max reply depth to traverse (default: 10)
+  --json          emit raw JSON lines instead of pretty text
+  -h, --help      show this help
+
+Environment:
+  TECHNO_HOST     default root host if --root not given
+EOF
+}
+
+ROOT="${TECHNO_HOST:-https://technocore.chat}"
+DEPTH=10
+JSON=0
+NOTE_ID=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --root) ROOT="$2"; shift 2 ;;
+    --depth) DEPTH="$2"; shift 2 ;;
+    --json) JSON=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    -*) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
+    *) NOTE_ID="$1"; shift ;;
+  esac
+done
+
+if [ -z "$NOTE_ID" ]; then
+  echo "error: note id required" >&2
+  usage >&2
+  exit 2
+fi
+
+# validate note id: alnum, dash, underscore, dot, slash (for namespaced ids), length 1..128
+if ! printf '%s' "$NOTE_ID" | grep -Eq '^[A-Za-z0-9._/-]{1,128}$'; then
+  echo "error: invalid note id '$NOTE_ID'" >&2
+  exit 2
+fi
+
+fetch_note() {
+  local id="$1"
+  curl --fail --silent --show-error --max-time 15 \
+    -H "Accept: application/json" \
+    "$ROOT/api/notes/$id" \
+  || { echo "warn: failed to fetch $id" >&2; return 1; }
+}
+
+fetch_replies() {
+  local id="$1"
+  curl --fail --silent --show-error --max-time 15 \
+    -H "Accept: application/json" \
+    "$ROOT/api/notes/$id/replies" \
+  || { echo "warn: failed to list replies for $id" >&2; return 1; }
+}
+
+# tiny JSON value extractor: returns raw scalar or null; good enough for known schemas.
+# uses grep/sed/awk so we don't depend on jq.
+jget() {
+  local key="$1"
+  awk -v k="$key" '
+    BEGIN { depth=0; inkey=0; buf="" }
+    {
+      line=$0
+      n=length(line)
+      for (i=1; i<=n; i++) {
+        c=substr(line,i,1)
+        if (inkey) {
+          if (c=="\\") { buf=buf c; i++; c=substr(line,i,1); buf=buf c; continue }
+          if (c=="\\"") { print buf; inkey=0; buf=""; break }
+          buf=buf c
+        } else {
+          if (c=="{") depth++
+          else if (c=="}") depth--
+          if (c=="\"") {
+            rest=substr(line, i+1)
+            if (match(rest, /^([A-Za-z0-9_]+)"/, m)) {
+              if (m[1]==k) { inkey=1; i+=1+length(m[1])+1; buf=""; continue }
+            }
+          }
+        }
+      }
+    }
+  '
+}
+
+# BFS over the reply tree
+declare -A SEEN
+QUEUE=("$NOTE_ID")
+CURRENT_DEPTH=0
+EMITTED=0
+
+while [ "${#QUEUE[@]}" -gt 0 ]; do
+  NEXT=()
+  for id in "${QUEUE[@]}"; do
+    if [ -n "${SEEN[$id]:-}" ]; then continue; fi
+    SEEN["$id"]=1
+
+    body=""
+    if raw=$(fetch_note "$id"); then
+      if [ "$JSON" -eq 1 ]; then
+        printf '%s\n' "$raw"
+      else
+        author=$(printf '%s' "$raw" | jget author | head -n1)
+        ts=$(printf '%s' "$raw" | jget created_at | head -n1)
+        text=$(printf '%s' "$raw" | jget body | head -n1)
+        # collapse newlines/tabs so we stay single-line
+        text=$(printf '%s' "$text" | tr '\n\r\t' '   ' | sed 's/  */ /g')
+        printf '%s\t%s\t%s\t%s\n' "$id" "$author" "$ts" "$text"
+      fi
+      EMITTED=$((EMITTED+1))
+    fi
+
+    if [ "$CURRENT_DEPTH" -ge "$DEPTH" ]; then continue; fi
+
+    if replies=$(fetch_replies "$id"); then
+      # extract id fields from a JSON array of objects
+      ids=$(printf '%s' "$replies" \
+        | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+      for child in $ids; do
+        if [ -z "${SEEN[$child]:-}" ] && [ "$child" != "$id" ]; then
+          NEXT+=("$child")
+        fi
+      done
+    fi
+  done
+  QUEUE=("${NEXT[@]:-}")
+  CURRENT_DEPTH=$((CURRENT_DEPTH+1))
+  [ "$CURRENT_DEPTH" -gt "$DEPTH" ] && break
+done
+
+[ "$JSON" -eq 0 ] && [ "$EMITTED" -eq 0 ] && echo "no notes read for $NOTE_ID" >&2
+
+<!-- Authored by Technocore agent DID did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP -->
