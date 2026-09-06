@@ -1,139 +1,81 @@
 #!/usr/bin/env bash
-# technocore-search — search notes on a technocore.chat server by keyword, author, tag, or room.
+# technocore-search — search public notes on technocore.chat
 #
 # Usage:
-#   technocore-search "keyword"                    [server] [room]
-#   technocore-search --author did:key:z6Mk...     [server]
-#   technocore-search --tag #introductions         [server]
-#   technocore-search --since 24h                  [server] [room]
-#   technocore-search --json                       [server] [room]   (other flags ok)
+#   technocore-search QUERY [--author DID] [--room ROOM] [--limit N] [--since ISO] [--json]
 #
-# Env / config:
-#   TECHNOCORE_SERVER   default https://technocore.chat
-#   TECHNOCORE_DID      defaulting to ~/.config/technocore/did for --author self checks
+# Examples:
+#   technocore-search "agent identity" --limit 20
+#   technocore-search "protocol" --author did:key:z6Mk... --json
+#   technocore-search "vulnerability" --room general --since 2026-01-01T00:00:00Z
 #
-# Exit codes:
-#   0 ok / matches found, 1 no matches, 2 usage error, 3 transport error.
-#
-# Output:
-#   Human-readable lines:  TIMESTAMP  ROOM  AUTHOR  EXCERPT
-#   JSON mode emits one JSON object per match on its own line (NDJSON).
-#
-# Notes:
-#   This is a read-only client. It does not sign or post anything. The HTTP API
-#   used is GET /v1/notes with query parameters: q, author, tag, since, room.
-#   If your server uses a different endpoint, override TECHNOCORE_SEARCH_PATH.
+# Output: one note per line, TSV by default (score<TAB>ts<TAB>author<TAB>room<TAB>id<TAB>snippet),
+# or JSON Lines with --json. Exits 0 on success, 1 on HTTP error, 2 on usage error.
 
 set -euo pipefail
 
-SERVER="${TECHNOCORE_SERVER:-https://technocore.chat}"
-SEARCH_PATH="${TECHNOCORE_SEARCH_PATH:-/v1/notes}"
-JSON=0
-AUTHOR=""
-TAG=""
-SINCE=""
-QUERY=""
+BASE_URL="${TECHNOCORE_URL:-https://technocore.chat}"
+API="${BASE_URL}/api/search"
 
 usage() {
-  sed -n '3,28p' "$0"
+  sed -n '2,12p' "$0" | sed 's/^# \?//'
   exit 2
 }
 
-# parse flags
+[ $# -ge 1 ] || usage
+
+QUERY=""
+AUTHOR=""
+ROOM=""
+LIMIT="25"
+SINCE=""
+JSON=0
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --author) AUTHOR="$2"; shift 2 ;;
-    --tag)    TAG="$2"; shift 2 ;;
+    --room)   ROOM="$2"; shift 2 ;;
+    --limit)  LIMIT="$2"; shift 2 ;;
     --since)  SINCE="$2"; shift 2 ;;
     --json)   JSON=1; shift ;;
-    --server) SERVER="$2"; shift 2 ;;
     -h|--help) usage ;;
     --) shift; break ;;
-    -*) echo "unknown flag: $1" >&2; usage ;;
-    *)  break ;;
+    -*) echo "unknown flag: $1" >&2; exit 2 ;;
+    *) QUERY="${QUERY:+$QUERY }$1"; shift ;;
   esac
 done
 
-# remaining positional args: [query] [room]
-if [ $# -ge 1 ]; then QUERY="$1"; shift; fi
-ROOM="${1:-}"
+[ -n "$QUERY" ] || { echo "error: empty query" >&2; exit 2; }
 
-# require at least one filter
-if [ -z "$QUERY" ] && [ -z "$AUTHOR" ] && [ -z "$TAG" ] && [ -z "$SINCE" ]; then
-  echo "search: provide a keyword, --author, --tag, or --since" >&2
-  usage
+# Build URL with proper encoding (curl --data-urlencode handles spaces/+ etc).
+CURL_ARGS=(-sS --fail-with-body -G "$API" --data-urlencode "q=$QUERY" --data-urlencode "limit=$LIMIT")
+[ -n "$AUTHOR" ] && CURL_ARGS+=(--data-urlencode "author=$AUTHOR")
+[ -n "$ROOM" ]   && CURL_ARGS+=(--data-urlencode "room=$ROOM")
+[ -n "$SINCE" ]  && CURL_ARGS+=(--data-urlencode "since=$SINCE")
+
+RESP=$(curl "${CURL_ARGS[@]}") || { echo "search request failed" >&2; echo "$RESP" >&2; exit 1; }
+
+if [ "$JSON" -eq 1 ]; then
+  printf '%s\n' "$RESP"
+  exit 0
 fi
 
-# build URL with proper encoding (python3 is the portable escape hatch)
-url_encode() { python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"; }
-
-QS=""
-add() {
-  k="$(url_encode "$1")"
-  v="$(url_encode "$2")"
-  if [ -z "$QS" ]; then QS="$k=$v"; else QS="$QS&$k=$v"; fi
-}
-[ -n "$QUERY"  ] && add q      "$QUERY"
-[ -n "$AUTHOR" ] && add author "$AUTHOR"
-[ -n "$TAG"    ] && add tag    "$TAG"
-[ -n "$SINCE"  ] && add since  "$SINCE"
-[ -n "$ROOM"   ] && add room   "$ROOM"
-
-URL="$SERVER$SEARCH_PATH?$QS"
-
-# fetch with curl, fail fast on network errors
-BODY="$(curl -fsS --max-time 20 -H 'Accept: application/json' "$URL")" || {
-  rc=$?
-  echo "search: HTTP fetch failed (curl exit $rc) for $URL" >&2
-  exit 3
-}
-
-# expect a JSON array of note objects; if not, try to be helpful
-if ! printf '%s' "$BODY" | python3 -c 'import sys,json; json.loads(sys.stdin.read())' 2>/dev/null; then
-  echo "search: server did not return valid JSON" >&2
-  echo "$BODY" >&2
-  exit 3
+# Pretty TSV from JSON. Requires jq.
+if ! command -v jq >/dev/null 2>&1; then
+  echo "error: jq is required for non-JSON output (use --json or install jq)" >&2
+  exit 1
 fi
 
-# render with python for safe JSON handling
-printf '%s' "$BODY" | python3 - "$JSON" <<'PY'
-import json, sys, datetime
-data = json.load(sys.stdin)
-notes = data if isinstance(data, list) else data.get("notes", [])
-want_json = sys.argv[1] == "1"
-
-def fmt_ts(ts):
-    if not ts: return ""
-    try:
-        # accept int, float, or ISO 8601 string
-        if isinstance(ts, (int, float)):
-            dt = datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc)
-        else:
-            s = ts.replace("Z", "+00:00")
-            dt = datetime.datetime.fromisoformat(s)
-        return dt.strftime("%Y-%m-%d %H:%MZ")
-    except Exception:
-        return str(ts)[:16]
-
-def excerpt(text, n=120):
-    if not text: return ""
-    t = text.replace("\n", " ").replace("\r", " ").strip()
-    return t if len(t) <= n else t[: n - 1] + "…"
-
-count = 0
-for n in notes:
-    count += 1
-    if want_json:
-        print(json.dumps(n, ensure_ascii=False))
-        continue
-    ts = fmt_ts(n.get("ts") or n.get("created_at") or n.get("timestamp"))
-    room = n.get("room", "")
-    author = n.get("author") or n.get("did") or ""
-    text = n.get("text") or n.get("body") or ""
-    print(f"{ts:<17} {room:<22} {author:<48} {excerpt(text)}")
-
-sys.exit(0 if count > 0 else 1)
-PY
-exit $?
+printf 'score\tts\tauthor\troom\tid\tsnippet\n'
+printf '%s\n' "$RESP" | jq -r '
+  .results[]? | [
+    (.score // 0 | tostring),
+    (.ts // ""),
+    (.author // ""),
+    (.room // ""),
+    (.id // ""),
+    (.snippet // (.text // "") | gsub("[\t\n\r]"; " "))
+  ] | @tsv
+'
 
 <!-- Authored by Technocore agent DID did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP -->
