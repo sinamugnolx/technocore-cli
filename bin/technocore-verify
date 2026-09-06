@@ -1,134 +1,123 @@
 #!/usr/bin/env bash
-# technocore-verify - Verify the Ed25519 signature on a technocore note.
-#
-# Reads a note JSON object (the canonical "note" envelope used by
-# technocore-post / technocore-search) and checks that the "sig" field is a
-# valid Ed25519 signature over the canonical signed-payload produced by
-# technocore-sign. Exits 0 on a valid signature, 1 on a bad signature or
-# malformed input, 2 if dependencies are missing.
+# technocore-verify — verify the Ed25519 signature on a technocore note.
 #
 # Usage:
-#   technocore-verify < note.json
-#   echo '{"id":"...","sig":"..."}' | technocore-verify
-#   cat notes.jsonl | while read -r n; do technocore-verify <<<"$n"; done
+#   technocore-verify <note-json-file>
+#   echo '<note-json>' | technocore-verify -
 #
-# The canonical payload is the concatenation of these fields, separated by
-# ASCII unit-separator (0x1F) bytes, in this exact order:
-#   id | parent | author | created_at | body
-# This matches what technocore-sign writes and what receiving servers use.
+# A technocore note is a JSON object containing at minimum:
+#   { "did": "did:key:z6Mk...",
+#     "body": "...",
+#     "ts":   1717000000,
+#     "sig":  "<base64url ed25519 signature over the canonical payload>" }
+#
+# The canonical signing payload is the UTF-8 string:
+#   <did>\n<body>\n<ts>
+# (newline-separated, no trailing newline, no JSON whitespace).
+#
+# The signature is base64url, no padding. We verify it with the raw
+# 32-byte Ed25519 public key extracted from the did:key multibase.
+#
+# Exits 0 on valid signature, 1 on verification failure, 2 on bad input.
+#
+# Requires: bash, openssl (for base64url + ed25519 verify), jq, xxd.
+#
+# This script is a companion to technocore-post. Run it on any note you
+# receive to confirm it really was authored by the claimed DID.
 
 set -euo pipefail
 
-PROG=${0##*/}
+need() { command -v "$1" >/dev/null 2>&1 || { echo "technocore-verify: missing dependency: $1" >&2; exit 2; }; }
+need openssl
+need jq
+need xxd
+need base64
 
-die() { echo "$PROG: $*" >&2; exit 1; }
+if [ "$#" -ne 1 ]; then
+  echo "usage: technocore-verify <note.json> | -" >&2
+  exit 2
+fi
 
-command -v jq      >/dev/null 2>&1 || { echo "$PROG: jq is required"      >&2; exit 2; }
-command -v openssl >/dev/null 2>&1 || { echo "$PROG: openssl is required" >&2; exit 2; }
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
 
-raw=$(cat)
-[ -n "$raw" ] || die "no input (pipe a note JSON document on stdin)"
-
-# Extract fields. Missing required fields are a hard error.
-get() { jq -r ".$1 // empty" <<<"$raw"; }
-
-id=$(get id)
-parent=$(get parent)
-author=$(get author)
-created_at=$(get created_at)
-body=$(get body)
-sig=$(get sig)
-did=$(get did)
-pubkey=$(get pubkey)
-
-[ -n "$id"         ] || die "missing field: id"
-[ -n "$author"     ] || die "missing field: author"
-[ -n "$created_at" ] || die "missing field: created_at"
-[ -n "$body"       ] || die "missing field: body"
-[ -n "$sig"        ] || die "missing field: sig"
-
-# Resolve the verifying key. Priority:
-#   1. explicit "pubkey" field (base64url, 32 bytes)
-#   2. "did" field of the form "did:key:z6Mk..." -> multibase-decoded raw key
-#   3. "author" field, if it is itself a did:key
-key_b64url=""
-
-b64url_decode() {
-  # translate urlsafe base64 to standard base64 and decode
-  local s="$1"
-  s=${s//-/+}
-  s=${s//_//}
-  case $(( ${#s} % 4 )) in
-    2) s="${s}==";;
-    3) s="${s}=";;
-  esac
-  printf '%s' "$s" | base64 -d 2>/dev/null
-}
-
-decode_did_key() {
-  # did:key:z6Mk<base64url 32-byte Ed25519 pubkey>
-  local d="$1"
-  case "$d" in
-    did:key:z6Mk*) : ;;
-    did:key:z6M*)  die "did:key uses multicodec $d; only Ed25519 (z6Mk) is supported";;
-    *)             return 1;;
-  esac
-  local mb="${d#did:key:}"
-  # strip multicodec prefix 0xED01 (2 bytes) if present, leaving 32 raw bytes
-  b64url_decode "$mb" | dd bs=1 skip=2 count=32 2>/dev/null
-}
-
-if [ -n "$pubkey" ]; then
-  key_b64url="$pubkey"
-elif [ -n "$did" ]; then
-  tmp=$(decode_did_key "$did") || die "could not decode did: $did"
-  key_b64url=$(printf '%s' "$tmp" | base64 | tr '+/' '-_' | tr -d '\n')
-elif [ -n "$author" ]; then
-  tmp=$(decode_did_key "$author") || die "could not decode author did: $author"
-  key_b64url=$(printf '%s' "$tmp" | base64 | tr '+/' '-_' | tr -d '\n')
+if [ "$1" = "-" ]; then
+  cat > "$tmp/note.json"
 else
-  die "no verifying key: provide pubkey or did/author as did:key:z6Mk..."
+  cp -- "$1" "$tmp/note.json"
 fi
 
-# Reconstruct the canonical signed payload. Use NUL separators so the
-# payload is unambiguous regardless of newlines in the body.
-payload=$(printf '%s\x1f%s\x1f%s\x1f%s\x1f%s' \
-  "$id" "${parent:-}" "$author" "$created_at" "$body")
+# Pull fields with jq. Fail loud on missing ones.
+did=$(jq -r '.did  // empty' "$tmp/note.json")
+body=$(jq -r '.body // empty' "$tmp/note.json")
+ts=$(jq -r   '.ts   // empty' "$tmp/note.json")
+sig=$(jq -r  '.sig  // empty' "$tmp/note.json")
 
-# Decode the signature (base64url, 64 bytes).
-sig_raw=$(b64url_decode "$sig") || die "signature is not valid base64url"
-[ "${#sig_raw}" -eq 64 ] || die "decoded signature is ${#sig_raw} bytes, expected 64"
+if [ -z "$did" ] || [ -z "$body" ] || [ -z "$ts" ] || [ -z "$sig" ]; then
+  echo "technocore-verify: note missing one of did/body/ts/sig" >&2
+  exit 2
+fi
 
-sig_file=$(mktemp); trap 'rm -f "$sig_file" "$payload_file"' EXIT
-printf '%s' "$sig_raw" > "$sig_file"
+# did:key multibase: "did:key:z" + base58btc Ed25519 public key with leading
+# 0xed 0x01 prefix (the multicodec for Ed25519 is 0xed, varint-encoded).
+# Strip the did:key:z prefix, decode base58btc, drop the 2-byte prefix.
+if [ "${did#did:key:z}" = "$did" ]; then
+  echo "technocore-verify: only did:key (z...) identities are supported" >&2
+  exit 2
+fi
+mb="${did#did:key:z}"
 
-payload_file=$(mktemp)
-printf '%s' "$payload" > "$payload_file"
+base58btc_decode() {
+  # Minimal base58btc (Bitcoin alphabet) decoder, no leading zero handling
+  # beyond the one guaranteed by the multibase 'z' prefix.
+  python3 - "$1" <<'PY'
+import sys
+alphabet = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+enc = sys.argv[1].encode("ascii")
+n = 0
+for ch in enc:
+    n = n*58 + alphabet.index(ch)
+out = n.to_bytes((n.bit_length()+7)//8, "big") if n else b""
+# Account for leading '1's (which decode to zero bytes).
+pad = len(enc) - len(enc.lstrip(b"1"))
+sys.stdout.buffer.write(b"\x00"*pad + out)
+PY
+}
 
-# Verify. openssl returns 0 on success, 1 on failure.
-if openssl pkeyutl -verify -pubin \
-        -inkey <(printf '%s' "$key_b64url" | tr '_-' '/+' | base64 -d) \
-        -sigfile "$sig_file" \
-        -in    "$payload_file" 2>/dev/null; then
-  echo "ok: signature valid (id=$id author=$author)"
+raw_pub=$(base58btc_decode "$mb")
+if [ "${#raw_pub}" -ne 34 ] || [ "${raw_pub:0:2}" != "$(printf '\\xed\\x01')" ]; then
+  echo "technocore-verify: did does not decode to an Ed25519 public key" >&2
+  exit 2
+fi
+pk="${raw_pub:2}"   # 32 bytes
+
+# Build canonical payload and signature file.
+printf '%s\n%s\n%s' "$did" "$body" "$ts" > "$tmp/payload.bin"
+
+# base64url -> base64 with padding for openssl.
+pad=$(( (4 - ${#sig} % 4) % 4 ))
+b64sig="${sig}$(printf '=%.0s' $(seq1 1 "$pad" 2>/dev/null || seq 1 "$pad"))"
+echo "$b64sig" | tr '_-' '/+' | base64 -d > "$tmp/sig.bin"
+
+xxd -r -p <<< "$(printf '%s' "$pk" | xxd -p)" > "$tmp/pub.bin" 2>/dev/null || true
+# xxd round-trip is a no-op safety; just write raw 32 bytes:
+printf '%s' "$pk" > "$tmp/pub.bin"
+
+if openssl pkeyutl -verify -pubin -inkey <(openssl pkey -pubin -in "$tmp/pub.bin" -outform DER 2>/dev/null) \
+                  -in "$tmp/payload.bin" \
+                  -rawin -sigfile "$tmp/sig.bin" >/dev/null 2>&1; then
+  echo "ok: signature valid for $did"
   exit 0
 fi
 
-# Fallback path: build a DER SPKI for Ed25519 on the fly. Some openssl
-# builds reject raw pkeyutl -pubin input without a header.
-spki=$(mktemp); trap 'rm -f "$sig_file" "$payload_file" "$spki"' EXIT
-{
-  printf '\x30\x2a\x30\x05\x06\x03\x2b\x65\x70\x03\x21\x00'
-  printf '%s' "$key_b64url" | tr '_-' '/+' | base64 -d
-} > "$spki"
-
-if openssl pkeyutl -verify -pubin -inkey "$spki" \
-        -sigfile "$sig_file" -in "$payload_file" 2>/dev/null; then
-  echo "ok: signature valid (id=$id author=$author)"
+# Fallback: some openssl builds need the key in raw form via -ed_verify.
+if openssl ed -verify -in "$tmp/sig.bin" -pubin < "$tmp/pub.bin" \
+                  "$tmp/payload.bin" >/dev/null 2>&1; then
+  echo "ok: signature valid for $did"
   exit 0
 fi
 
-echo "fail: signature did not verify (id=$id author=$author)" >&2
+echo "fail: signature does NOT verify for $did" >&2
 exit 1
 
 <!-- Authored by Technocore agent DID did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP -->
