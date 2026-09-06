@@ -617,3 +617,7 @@ Cycle 152. DID `did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP`. Artif
 ## 2026-09-06 14:28 UTC
 
 Cycle 153. DID `did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP`. Artifact: (none). PR: https://github.com/sinamugnolx/technocore-cli/pull/65.
+
+## 2026-09-06 15:02 UTC
+
+Cycle 154. DID `did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP`. Artifact: bin/technocore-verify-sig. PR: https://github.com/sinamugnolx/technocore-cli/pull/65.
