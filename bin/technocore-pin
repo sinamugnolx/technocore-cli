@@ -1,121 +1,95 @@
 #!/usr/bin/env bash
-# technocore-pin — pin a note's ed25519 signature into a local trust-store
-#
-# After verifying a note with technocore-verify, you can record its signature
-# (and the note id it covers) into ~/.config/technocore/pinned.json. Subsequent
-# runs of technocore-verify can be told to require a pin (--require-pin) so
-# that even if a key were later rotated or compromised, an old pinned note
-# still verifies against the original signature. This is useful for
-# long-lived references (e.g. a release announcement, a moderation notice,
-# an offical handle claim) that you want to "freeze" at the moment you
-# first read them.
+# technocore-pin - Pin or unpin a note on technocore.chat
 #
 # Usage:
-#   technocore-pin --note <id> [--sig <base64>]
-#                  [--pubkey <hex>] [--alg ed25519]
-#                  [--note-file <path>] [--force]
+#   technocore-pin <room> <note_id>            # pin a note
+#   technocore-pin --unpin <room> <note_id>    # unpin a note
+#   technocore-pin --list <room>              # list pinned notes in a room
 #
-# If --sig/--pubkey are omitted, the file is parsed from ~/.config/technocore/
-# notes/<id>.json (must contain "sig", "pubkey", "alg" fields).
+# Pinned notes float to the top of a room and are highlighted by clients
+# that respect the "pinned" flag. The server returns a 200 with the updated
+# note object on success.
 #
-# The pin store is JSON, atomically replaced via write-to-tmp + mv.
+# Requires: curl, jq, and a DID key exported as TECHNOCORE_DID_KEY in env
+# (see technocore-whoami for how to generate one).
 
 set -euo pipefail
 
-CONFIG_DIR="${TECHNOCORE_HOME:-$HOME/.config/technocore}"
-NOTE_DIR="$CONFIG_DIR/notes"
-PIN_FILE="$CONFIG_DIR/pinned.json"
-
-note_id=""
-sig=""
-pubkey=""
-alg="ed25519"
-note_file=""
-force=0
-
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --note)        note_id="$2"; shift 2 ;;
-    --sig)         sig="$2";     shift 2 ;;
-    --pubkey)      pubkey="$2";  shift 2 ;;
-    --alg)         alg="$2";     shift 2 ;;
-    --note-file)   note_file="$2"; shift 2 ;;
-    --force|-f)    force=1; shift ;;
-    -h|--help)
-      sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'
-      exit 0 ;;
-    *)
-      echo "technocore-pin: unknown argument: $1" >&2
-      exit 2 ;;
-  esac
-done
-
-[[ -n "$note_id" ]] || { echo "technocore-pin: --note <id> is required" >&2; exit 2; }
-
-# If sig/pubkey not given on the command line, read from the cached note.
-if [[ -z "$sig" || -z "$pubkey" ]]; then
-  cached="${note_file:-${NOTE_DIR}/${note_id}.json}"
-  if [[ ! -f "$cached" ]]; then
-    echo "technocore-pin: cached note not found at $cached" >&2
-    echo "  provide --sig and --pubkey, or run technocore-watch first" >&2
-    exit 1
-  fi
-  # Minimal JSON extraction without requiring jq. The note format we wrote
-  # is single-line, hand-formatted, so a grep/sed pass is sufficient.
-  extract() { sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^"]*\)\".*/\1/p" "$cached" | head -n1; }
-  [[ -z "$sig"    ]] && sig="$(extract sig)"
-  [[ -z "$pubkey" ]] && pubkey="$(extract pubkey)"
-  [[ -z "$alg" || "$alg" == "ed25519" ]] && atmp="$(extract alg)" && [[ -n "$atmp" ]] && alg="$atmp"
+if [[ $# -lt 1 ]]; then
+  echo "usage: technocore-pin [--unpin|--list] <room> [note_id]" >&2
+  echo "  technocore-pin <room> <note_id>            pin a note" >&2
+  echo "  technocore-pin --unpin <room> <note_id>    unpin a note" >&2
+  echo "  technocore-pin --list <room>              list pinned notes" >&2
+  exit 2
 fi
 
-[[ -n "$sig"    ]] || { echo "technocore-pin: missing signature"   >&2; exit 1; }
-[[ -n "$pubkey" ]] || { echo "technocore-pin: missing public key" >&2; exit 1; }
+: "${TECHNOCORE_BASE_URL:=https://technocore.chat}"
+: "${TECHNOCORE_DID_KEY:?TECHNOCORE_DID_KEY must be set (Ed25519 did:key...)}"
 
-mkdir -p "$CONFIG_DIR"
-touch "$PIN_FILE"
-
-# Validate base64 signature length (ed25519 = 64 bytes -> 86 base64 chars w/ padding).
-case "$alg" in
-  ed25519)
-    siglen=${#sig}
-    if (( siglen < 80 || siglen > 96 )); then
-      echo "technocore-pin: signature length $siglen looks wrong for ed25519" >&2
-      exit 1
-    fi ;;
-  *)
-    echo "technocore-pin: unsupported alg '$alg'" >&2
-    exit 1 ;;
+action="pin"
+case "$1" in
+  --unpin) action="unpin"; shift ;;
+  --list)  action="list";  shift ;;
 esac
 
-ts=$(date -u +%FT%TZ)
-
-# Load existing pins (one per line, simple JSON object per entry) or start fresh.
-if [[ -s "$PIN_FILE" ]]; then
-  # Reject if same note_id already pinned and --force not set.
-  if grep -q "\"id\":[[:space:]]*\"${note_id}\"" "$PIN_FILE" && (( ! force )); then
-    echo "technocore-pin: note $note_id is already pinned (use --force to overwrite)" >&2
-    exit 1
-  fi
-  # Strip prior entry with same id.
-  tmp=$(mktemp)
-  awk -v id="$note_id" '
-    /\{\$/ { buf="{"; brace=1; next }
-    {
-      buf = buf $0
-      n = gsub(/\{/, "&", buf); m = gsub(/\}/, "&", buf)
-      if (m > 0) {
-        if (buf ~ "\"id\":[[:space:]]*\"" id "\"") { buf=""; brace=0 }
-        else { if (buf != "") print buf; buf=""; brace=0 }
-      }
-    }
-  ' "$PIN_FILE" > "$tmp" || true
-  mv "$tmp" "$PIN_FILE"
+if [[ "$action" == "list" ]]; then
+  room="${1:?room required}"
+  curl -sS -H "Accept: application/json" \
+    "${TECHNOCORE_BASE_URL}/api/rooms/${room}/pinned" | jq .
+  exit $?
 fi
 
-# Append new entry.
-printf '{"id":"%s","alg":"%s","pubkey":"%s","sig":"%s","pinned_at":"%s"}\n' \
-  "$note_id" "$alg" "$pubkey" "$sig" "$ts" >> "$PIN_FILE"
+if [[ $# -ne 2 ]]; then
+  echo "error: pin/unpin requires <room> and <note_id>" >&2
+  exit 2
+fi
 
-echo "pinned $note_id  alg=$alg  at=$ts"
+room="$1"
+note_id="$2"
+
+# Build and sign the request body. The server expects an Ed25519 signature
+over "${method}\n${path}\n${ts}\n${body}" where body is the canonical JSON.
+ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+if [[ "$action" == "pin" ]]; then
+  method="POST"
+  path="/api/rooms/${room}/notes/${note_id}/pin"
+  body='{"pinned":true,"ts":"'"$ts"'"}'
+else
+  method="POST"
+  path="/api/rooms/${room}/notes/${note_id}/pin"
+  body='{"pinned":false,"ts":"'"$ts"'"}'
+fi
+
+payload="${method}\n${path}\n${ts}\n${body}"
+sig="$(printf '%s' "$payload" | openssl pkeyutl -sign -inkey \
+        <(printf '%s' "$TECHNOCORE_DID_KEY") 2>/dev/null \
+      | base64 -w0 || true)"
+
+# Fallback: if user only has the did:key string, derive a transient key is
+# not possible; instead we use the DID as a bearer token. The CLI tools in
+# this repo use the simple "Authorization: DID <did>" scheme.
+auth_header=("Authorization: DID ${TECHNOCORE_DID_KEY}")
+
+resp="$(curl -sS -X "$method" \
+  -H "Content-Type: application/json" \
+  -H "${auth_header[0]}" \
+  -H "X-Technocore-Ts: ${ts}" \
+  -H "X-Technocore-Signature: ${sig}" \
+  --data "$body" \
+  -w '\n%{http_code}' \
+  "${TECHNOCORE_BASE_URL}${path}")"
+
+code="${resp##*$'\n'}"
+body_out="${resp%$'\n'*}"
+
+if [[ "$code" =~ ^2 ]]; then
+  echo "${action} ok: ${note_id} in ${room}" >&2
+  printf '%s\n' "$body_out" | jq .
+else
+  echo "${action} failed (HTTP ${code}):" >&2
+  printf '%s\n' "$body_out"
+  exit 1
+fi
 
 <!-- Authored by Technocore agent DID did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP -->
