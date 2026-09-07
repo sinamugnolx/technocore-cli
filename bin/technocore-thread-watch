@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# technocore-thread-watch — poll a thread and emit only new notes since last seen.
+#
+# Usage:
+#   technocore-thread-watch <thread_id> [--once] [--state <path>] [--interval <sec>]
+#
+# State file (default: ~/.cache/technocore/watch/<thread_id>) tracks the last
+# seen note id. On run it fetches the thread, prints any new notes newer than
+# the checkpoint, then advances the checkpoint. Designed to be cron-/loop-
+# friendly and safe to interrupt.
+#
+# Output: each new note is emitted as a single JSON object on its own line
+# ({"id":..., "author":..., "created_at":..., "body":..., "is_new":true}).
+# A final summary line is printed: {"event":"summary","old":N,"new":M}.
+#
+# Exit codes: 0 ok, 1 usage, 2 network, 3 invalid thread.
+
+set -u
+
+PROG=${0##*/}
+THREAD=""
+ONCE=0
+STATE_DIR="${TECHNOCORE_CACHE:-$HOME/.cache/technocore/watch}"
+INTERVAL=30
+
+die() { echo "$PROG: $*" >&2; exit 1; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help)
+        sed -n '2,20p' "$0" | sed 's/^# \?//'
+        exit 0
+        ;;
+    --once) ONCE=1; shift ;;
+    --state) STATE_DIR=$2; shift 2 ;;
+    --interval) INTERVAL=$2; shift 2 ;;
+    --*) die "unknown flag: $1" ;;
+    *)
+        [ -z "$THREAD" ] || die "only one thread id allowed"
+        THREAD=$1; shift ;;
+  esac
+done
+
+[ -n "$THREAD" ] || die "usage: $PROG <thread_id> [--once] [--state <dir>] [--interval <sec>]"
+
+mkdir -p "$STATE_DIR" || die "cannot create state dir: $STATE_DIR"
+STATE_FILE="$STATE_DIR/$THREAD"
+touch "$STATE_DIR/$THREAD.seen" || die "cannot init state"
+
+fetch_thread() {
+  # Fetch thread JSON from the technocore HTTP API.
+  # Expected: GET /threads/<id> with body {"thread":..., "notes":[{id,author,created_at,body}, ...]}
+  # Notes are returned in chronological order.
+  local url="${TECHNOCORE_BASE:-http://127.0.0.1:7333}/threads/$THREAD"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsS --max-time 15 "$url" || return 2
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO- --timeout=15 "$url" || return 2
+  else
+    echo "$PROG: need curl or wget" >&2
+    return 2
+  fi
+}
+
+# Validate thread id (alnum, dash, underscore, 4..64 chars).
+case "$THREAD" in
+  ''|*[!A-Za-z0-9_-]*) die "invalid thread id" ;;
+esac
+[ "${#THREAD}" -ge 4 ] && [ "${#THREAD}" -le 64 ] || die "invalid thread id length"
+
+last_seen=""
+[ -s "$STATE_FILE" ] && last_seen=$(cat "$STATE_FILE")
+
+emit_new() {
+  # $1 = json blob from fetch_thread
+  python3 - "$last_seen" <<'PY' || return 3
+import json, sys
+raw = sys.stdin.read()
+last = sys.argv[1].strip()
+try:
+    data = json.loads(raw)
+except Exception as e:
+    print(f"parse error: {e}", file=sys.stderr)
+    sys.exit(3)
+notes = data.get("notes", [])
+ids = [n.get("id","") for n in notes]
+if last and last in ids:
+    cut = ids.index(last) + 1
+    new_notes = notes[cut:]
+else:
+    new_notes = notes
+new_count = 0
+for n in new_notes:
+    n["is_new"] = True
+    print(json.dumps(n, ensure_ascii=False))
+    new_count += 1
+last_id = notes[-1]["id"] if notes else last
+print(json.dumps({"event":"summary","old":len(notes)-new_count,"new":new_count,"last_id":last_id}))
+sys.stdout.flush()
+PY
+}
+
+update_state() {
+  # $1 = last_id
+  [ -n "$1" ] && printf '%s\n' "$1" > "$STATE_FILE"
+}
+
+trap 'echo "$PROG: interrupted" >&2; exit 130' INT TERM
+
+run_once() {
+  body=$(fetch_thread) || { rc=$?; echo "$PROG: fetch failed" >&2; exit $rc; }
+  summary=$(printf '%s\n' "$body" | emit_new 2>/dev/null)
+  rc=$?
+  if [ $rc -ne 0 ]; then exit $rc; fi
+  # split: all lines except last are notes, last is summary
+  printf '%s\n' "$summary" | sed '$d'
+  last_line=$(printf '%s\n' "$summary" | tail -n1)
+  new_last=$(printf '%s' "$last_line" | python3 -c 'import json,sys;print(json.loads(sys.stdin.read()).get("last_id",""))')
+  update_state "$new_last"
+  printf '%s\n' "$last_line"
+}
+
+if [ "$ONCE" -eq 1 ]; then
+  run_once
+  exit $?
+fi
+
+while :; do
+  run_once
+  sleep "$INTERVAL" || die "invalid interval: $INTERVAL"
+done
+
+<!-- Authored by Technocore agent DID did:key:z6MkpDB53jgRQSU6nN7cEQ9rcDbTgu7J5DsxvFgx329curEP -->
